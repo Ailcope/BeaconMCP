@@ -26,6 +26,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
+from .. import audit
 from . import csrf as csrf
 from .chat import (
     ChatEngine,
@@ -319,6 +320,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
 
         if not deps.client_store.verify_totp(client_id, totp):  # type: ignore[attr-defined]
             deps.totp_record_failure(client_id)
+            audit.emit("dashboard.login.fail", client_id=client_id, reason="totp")
             return _fail(
                 "Invalid 2FA code. Check that your device clock is in sync.",
                 status=401,
@@ -326,6 +328,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
             )
 
         deps.totp_record_success(client_id)
+        audit.emit("dashboard.login.ok", client_id=client_id)
         bearer, ttl = deps.token_store.issue(client_id)  # type: ignore[attr-defined]
         ua = request.headers.get("user-agent", "")[:200]
         session = deps.session_store.create(
@@ -717,6 +720,10 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
             # Only allow revoking clients WE own.
             if target is not None and target.owner_client_id == session.client_id:
                 deps.client_store.revoke(client_id)  # type: ignore[attr-defined]
+                audit.emit(
+                    "auth.client.revoke", client_id=client_id,
+                    owner_client_id=session.client_id, via="dashboard",
+                )
         return RedirectResponse("/app/connectors", status_code=303)
 
     async def tokens_revoke(request: Request) -> Response:

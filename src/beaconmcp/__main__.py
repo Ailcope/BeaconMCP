@@ -18,15 +18,42 @@ def _configure_logging() -> None:
     entry before any module-level ``_logger`` call can fire. Keeps the
     format compact so journalctl stays readable.
     """
-    if logging.getLogger().handlers:
-        return  # already configured (e.g. pytest, embedded use)
-    level_name = os.environ.get("BEACONMCP_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    if not logging.getLogger().handlers:
+        level_name = os.environ.get("BEACONMCP_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            stream=sys.stderr,
+        )
+    _configure_audit_log()
+
+
+def _configure_audit_log() -> None:
+    """Route the ``beaconmcp.audit`` logger to a dedicated JSON-lines file.
+
+    Path comes from ``BEACONMCP_AUDIT_LOG`` (default ``/opt/beaconmcp/audit.log``).
+    Each :func:`beaconmcp.audit.emit` call already produces one JSON object, so
+    the handler uses a bare ``%(message)s`` formatter. ``propagate`` is left on
+    so the same line still reaches journalctl; set the env var to ``-`` to
+    disable the file and keep stderr only.
+    """
+    audit_logger = logging.getLogger("beaconmcp.audit")
+    if any(isinstance(h, logging.FileHandler) for h in audit_logger.handlers):
+        return  # already wired
+    path = os.environ.get("BEACONMCP_AUDIT_LOG", "/opt/beaconmcp/audit.log").strip()
+    if not path or path == "-":
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(handler)
+        audit_logger.setLevel(logging.INFO)
+    except Exception:  # noqa: BLE001 -- audit file is best-effort
+        logging.getLogger("beaconmcp").warning(
+            "could not open audit log at %s; auditing to stderr only", path,
+        )
 
 
 _configure_logging()
@@ -302,7 +329,9 @@ def _cmd_auth(args):
         print()
 
     elif args.auth_command == "revoke":
+        from . import audit
         if store.revoke(args.client_id):
+            audit.emit("auth.client.revoke", client_id=args.client_id, via="cli")
             print(f"Client {args.client_id} revoked.")
         else:
             print(f"Client {args.client_id} not found.")
@@ -369,7 +398,12 @@ def _run_http(mcp, host: str, port: int):
     env_cf = os.environ.get("BEACONMCP_CLIENTS_FILE")
     clients_path = Path(env_cf) if env_cf else config.server.clients_file
     client_store = ClientStore(clients_path)
-    token_store = TokenStore()
+    # Persist named API tokens next to clients.json (override with
+    # BEACONMCP_TOKENS_DB) so a restart/redeploy no longer silently
+    # invalidates tokens users pasted into external clients.
+    env_tokens_db = os.environ.get("BEACONMCP_TOKENS_DB")
+    tokens_db = Path(env_tokens_db) if env_tokens_db else clients_path.parent / "tokens.db"
+    token_store = TokenStore(db_path=tokens_db)
     code_store = CodeStore()
     # Share the TokenStore with MCP tools so security_end_session can revoke
     # the caller's bearer without an import cycle.
@@ -791,12 +825,20 @@ h1 {{ margin: 0 0 4px; font-size: 22px; font-weight: 600; letter-spacing: -0.015
         code_totp = body.get("totp", "")
         if not client_store.verify_totp(client_id, code_totp):
             totp_record_failure(client_id)
+            audit.emit(
+                "auth.authorize.fail", client_id=client_id,
+                ip=client_ip(request, tuple(config.server.trusted_proxies)),
+            )
             return _render_authorize_form(
                 normalized,
                 error="Incorrect code. Check that your device clock is in sync.",
                 locked=totp_locked(client_id),
             )
         totp_record_success(client_id)
+        audit.emit(
+            "auth.authorize.ok", client_id=client_id,
+            ip=client_ip(request, tuple(config.server.trusted_proxies)),
+        )
 
         redirect_uri = normalized["redirect_uri"]
         code = code_store.issue(

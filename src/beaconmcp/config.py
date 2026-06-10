@@ -65,6 +65,12 @@ class SSHHost:
     port: int = 22
     password: str | None = None
     key_file: str | None = None
+    # Per-host host-key verification overrides. When unset (None) the host
+    # inherits the global ``ssh.known_hosts`` / ``ssh.strict_host_key_checking``
+    # settings. Set these on a single host (e.g. a public-internet VPS) to
+    # enforce strict checking there while trusted-LAN nodes stay permissive.
+    known_hosts: str | None = None
+    strict_host_key_checking: bool | None = None
 
 
 @dataclass
@@ -428,6 +434,7 @@ class Config:
                     )
                 host_addr = _required(h, "host", f"ssh.hosts[{host_name}]")
                 seen_addresses.add(host_addr)
+                host_strict_raw = h.get("strict_host_key_checking")
                 ssh_hosts.append(
                     SSHHost(
                         name=host_name,
@@ -436,6 +443,11 @@ class Config:
                         port=int(h.get("port", 22)),
                         password=password,
                         key_file=key_file,
+                        known_hosts=h.get("known_hosts") or None,
+                        strict_host_key_checking=(
+                            None if host_strict_raw is None
+                            else _bool(host_strict_raw)
+                        ),
                     )
                 )
 

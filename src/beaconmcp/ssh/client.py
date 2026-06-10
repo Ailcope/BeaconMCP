@@ -223,9 +223,16 @@ class SSHClient:
                 pass
             del _connection_cache[cache_key]
 
-        kh = self._config.ssh.known_hosts if self._config.ssh else None
-        strict = (
+        global_kh = self._config.ssh.known_hosts if self._config.ssh else None
+        global_strict = (
             self._config.ssh.strict_host_key_checking if self._config.ssh else False
+        )
+        # Per-host overrides win; ``None`` means "inherit the global setting".
+        kh = host_spec.known_hosts if host_spec.known_hosts is not None else global_kh
+        strict = (
+            host_spec.strict_host_key_checking
+            if host_spec.strict_host_key_checking is not None
+            else global_strict
         )
         conn = await _connect_to_host(
             host_spec, known_hosts=kh, strict_host_key_checking=strict,

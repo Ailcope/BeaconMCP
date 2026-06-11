@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -28,10 +29,16 @@ def _detect_backup_type(client: ProxmoxClient, node: str, archive: str) -> str |
     against renamed or non-standard archive names.
     """
     a = archive.lower()
-    if "vzdump-qemu-" in a or "/vm/" in a or "backup/vm-" in a:
+    if "vzdump-qemu-" in a or "backup/vm-" in a:
         return "qemu"
-    if "vzdump-lxc-" in a or "/ct/" in a or "backup/ct-" in a:
+    if "vzdump-lxc-" in a or "backup/ct-" in a:
         return "lxc"
+    # PBS namespaces: the guest-type segment is always followed by the
+    # numeric VMID (``backup/vm/100/...``, ``backup/ns/<ns>/ct/200/...``).
+    # Anchoring on the id avoids misreading a *namespace* named "vm"/"ct".
+    m = re.search(r"(?:^|/)(vm|ct)/\d+(?:/|$)", a)
+    if m:
+        return "qemu" if m.group(1) == "vm" else "lxc"
 
     # Fallback: look the volid up in its source storage's content listing and
     # read the type Proxmox itself reports.
@@ -44,7 +51,7 @@ def _detect_backup_type(client: ProxmoxClient, node: str, archive: str) -> str |
     if not isinstance(content, list):
         return None
     for item in content:
-        if item.get("volid") != archive:
+        if not isinstance(item, dict) or item.get("volid") != archive:
             continue
         subtype = (item.get("subtype") or item.get("vmtype") or "").lower()
         if subtype in ("qemu", "lxc"):

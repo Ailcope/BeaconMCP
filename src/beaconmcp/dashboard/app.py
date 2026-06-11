@@ -1153,6 +1153,12 @@ def _render_tokens_page(
     """Render the /app/tokens page (list + create form)."""
     tokens_raw = deps.token_store.list_named(session.client_id)  # type: ignore[attr-defined]
     now = time.time()
+    def _expires_label(expires_at: float) -> str:
+        secs = max(0, expires_at - now)
+        if secs >= 48 * 3600:
+            return f"expires in {round(secs / 86400)} days"
+        return f"expires in {max(0, round(secs / 3600, 1))} h"
+
     tokens = [
         {
             "name": t.name,
@@ -1160,11 +1166,17 @@ def _render_tokens_page(
             "created_at": t.created_at,
             "expires_at": t.expires_at,
             "expires_in_hours": max(0, round((t.expires_at - now) / 3600, 1)),
+            "expires_label": _expires_label(t.expires_at),
         }
         for t in tokens_raw
     ]
     count = len(tokens)
     cap = getattr(deps.token_store, "NAMED_TOKEN_CAP", 3)
+    # Named-token lifetime for the page copy (days, rounded).
+    named_ttl_seconds = getattr(
+        deps.token_store, "named_token_ttl", 24 * 3600,
+    )
+    named_ttl_days = max(1, round(named_ttl_seconds / 86400))
 
     client_name = (
         deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
@@ -1191,6 +1203,7 @@ def _render_tokens_page(
         tokens=tokens,
         count=count,
         cap=cap,
+        named_ttl_days=named_ttl_days,
         can_create=count < cap,
         form_error=form_error,
         form_name=form_name,

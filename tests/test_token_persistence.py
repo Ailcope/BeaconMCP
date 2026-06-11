@@ -72,6 +72,26 @@ def test_named_cap_enforced_after_reload(tmp_path: Path) -> None:
         reborn.issue("client-b", name="one-too-many")
 
 
+def test_named_token_uses_configured_ttl(tmp_path: Path) -> None:
+    db = tmp_path / "tokens.db"
+    store = TokenStore(db_path=db, named_token_ttl=7200)
+    _, expires_in = store.issue("client-a", name="laptop")
+    assert expires_in == 7200
+
+
+def test_internal_bearer_keeps_24h_ttl_regardless(tmp_path: Path) -> None:
+    db = tmp_path / "tokens.db"
+    store = TokenStore(db_path=db, named_token_ttl=7200)
+    _, expires_in = store.issue("client-a")  # unnamed: session bearer
+    assert expires_in == TokenStore.TOKEN_TTL
+
+
+def test_named_ttl_defaults_to_30_days(tmp_path: Path) -> None:
+    store = TokenStore(db_path=tmp_path / "tokens.db")
+    _, expires_in = store.issue("client-a", name="laptop")
+    assert expires_in == TokenStore.NAMED_TOKEN_TTL == 3600 * 24 * 30
+
+
 def test_unwritable_db_degrades_to_memory_only(tmp_path: Path) -> None:
     target = tmp_path / "blocked"
     target.write_text("not a directory")

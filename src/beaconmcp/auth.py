@@ -422,16 +422,30 @@ class TokenStore:
     ``systemctl restart`` / redeploy no longer silently invalidates them.
     """
 
-    TOKEN_TTL = 3600 * 24  # 24 hours
+    TOKEN_TTL = 3600 * 24  # 24 hours -- internal/session bearers
+    # Default lifetime for *named* tokens. They survive restarts (see the
+    # persistence block), so a 24 h cap defeats the point of a token pasted
+    # into an external client -- 30 days is the sensible default. Overridable
+    # per-deployment via ``named_token_ttl`` (server.named_token_ttl / env).
+    NAMED_TOKEN_TTL = 3600 * 24 * 30  # 30 days
     # Cap on named tokens (the ones listed in the dashboard's API
     # tokens page). Internal dashboard-session bearers are unlimited
     # because a re-login always revokes the prior one.
     NAMED_TOKEN_CAP = 3
 
-    def __init__(self, db_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        named_token_ttl: int | None = None,
+    ) -> None:
         self._tokens: dict[str, AccessToken] = {}
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        # Effective named-token lifetime: explicit value wins, else default.
+        self.named_token_ttl = (
+            named_token_ttl if named_token_ttl else self.NAMED_TOKEN_TTL
+        )
         if db_path is not None:
             self._init_db(Path(db_path))
 
@@ -512,12 +526,15 @@ class TokenStore:
                     f"client {client_id} already has "
                     f"{self.NAMED_TOKEN_CAP} named tokens"
                 )
+        # Named tokens get the (longer, configurable) named lifetime; internal
+        # session bearers keep the short 24 h TTL.
+        ttl = self.named_token_ttl if name is not None else self.TOKEN_TTL
         token = secrets.token_hex(32)
         now = time.time()
         at = AccessToken(
             token=token,
             client_id=client_id,
-            expires_at=now + self.TOKEN_TTL,
+            expires_at=now + ttl,
             name=name,
             created_at=now,
         )
@@ -525,7 +542,7 @@ class TokenStore:
         if name is not None:
             self._persist(at)
         self._cleanup()
-        return token, self.TOKEN_TTL
+        return token, ttl
 
     def list_named(self, client_id: str) -> list[AccessToken]:
         """Return named tokens for ``client_id`` (newest first)."""

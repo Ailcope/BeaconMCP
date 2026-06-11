@@ -245,11 +245,13 @@ Common keys:
 | `server.allowed_origins` | Web-origin allowlist for browser CORS and OAuth HTTPS redirect URIs. |
 | `server.trusted_proxies` | Direct peers allowed to supply `X-Forwarded-For` (IPs or CIDRs). Use `cloudflare` to auto-expand Cloudflare edge ranges. |
 | `proxmox.nodes[]` | One entry per Proxmox node. Needs an API token per node. Prefer a **LAN IP** in `host:` (e.g. `10.0.0.1`) — it's the one string that works for both the Proxmox API and for SSH inheritance. `localhost` is OK when BeaconMCP runs directly on that node. Only use an FQDN with a reverse-proxy port (e.g. `:443`) for nodes you can't reach on the LAN, and declare those explicitly under `ssh.hosts[]` with their real SSH address. |
-| `ssh.hosts[]` | One entry per SSH target (VPS, Proxmox node, jump box, …). Each entry carries its own `user` + exactly one of `password` / `key_file`. Names may match `proxmox.nodes[].name`. |
+| `ssh.hosts[]` | One entry per SSH target (VPS, Proxmox node, jump box, …). Each entry carries its own `user` + exactly one of `password` / `key_file`. Names may match `proxmox.nodes[].name`. Optional per-host `known_hosts` / `strict_host_key_checking` override the global `ssh.*` settings (overrides can only tighten, not loosen). |
 | `ssh.defaults` + `ssh.inherit_proxmox_nodes` | Homelab shortcut. Set `defaults:` (user + password/key_file) and flip `inherit_proxmox_nodes: true` — every Proxmox node becomes SSH-reachable under its own name with those defaults, no duplication. Explicit `ssh.hosts[]` entries still win when they match a node by name or address. |
 | `ssh.vmid_to_ip` | Optional template (e.g. `"192.168.1.{id}"`) used by `ssh_run` when the `host` argument is a bare VMID. The resolved IP must match an `ssh.hosts[].host` to authenticate. Omit to disable numeric-ID shortcuts. |
 | `bmc.devices[]` | Zero or more BMCs. `type` is one of `hp_ilo`, `ipmi`, `idrac` (redfish), `supermicro` (redfish), or `redfish`. `jump_host` is optional — set it to the name of a `proxmox.nodes[]` entry to route the connection over an SSH tunnel. |
 | `features.dashboard.limits` | Per-5h and per-week USD caps for the Gemini chat. Set to `0` to disable a window. |
+| `server.tokens_db` | SQLite file persisting *named* API tokens (dashboard `/app/tokens` page) across restarts, created owner-only (0600). Default: `tokens.db` next to `clients_file`. Env override: `BEACONMCP_TOKENS_DB`. |
+| `server.audit_log` | JSON-lines audit log (tool calls, dashboard logins, OAuth authorize, client revokes), created owner-only (0600). Default: `/opt/beaconmcp/audit.log`; set to `-` to keep stderr only. Env override: `BEACONMCP_AUDIT_LOG`. |
 
 ---
 
@@ -265,7 +267,7 @@ BeaconMCP exposes tools that cause irreversible changes: `ssh_run`, `proxmox_run
 - **Prefer read-only tools** (`*_list_*`, `*_status`, `*_get_*`, `get_logs`, `health_status`) for exploration — they cannot break anything and are never gated by confirmation.
 - **Do not share a `/app/tokens` bearer** with a client you do not fully control. A leaked token grants arbitrary shell access on your Proxmox nodes for 24 hours.
 
-`systemctl restart beaconmcp` invalidates every in-memory bearer. When in doubt about a token, restart is the panic lever.
+`systemctl restart beaconmcp` invalidates dashboard sessions and other internal bearers — but **named API tokens survive restarts** (they persist in `server.tokens_db`). To kill a named token, revoke it from `/app/tokens`; to kill all of them at once, delete the `tokens.db` file before restarting.
 
 ---
 

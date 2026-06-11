@@ -99,6 +99,11 @@ class SSHHostDraft:
     password_env: str = ""
     key_file: str = ""
     password_literal: str = ""
+    # Per-host host-key overrides. Empty string means "inherit the global
+    # ssh-level setting"; strict is tri-state ("", "true", "false") for the
+    # same reason.
+    known_hosts: str = ""
+    strict_host_key_checking: str = ""
 
 
 @dataclass
@@ -108,6 +113,10 @@ class SSHDraft:
     inherit_proxmox_nodes: bool = True
     defaults: SSHDefaultsDraft = field(default_factory=SSHDefaultsDraft)
     hosts: list[SSHHostDraft] = field(default_factory=list)
+    # Global host-key verification (see beaconmcp.yaml.example). Empty
+    # known_hosts + strict off keeps the permissive accept-any-key default.
+    known_hosts: str = ""
+    strict_host_key_checking: bool = False
 
 
 @dataclass
@@ -137,6 +146,12 @@ class ServerDraft:
     trusted_proxies: list[str] = field(default_factory=lambda: ["127.0.0.1", "::1"])
     session_key_env: str = ""  # env var name
     allow_dynamic_registration: bool = False
+    # Optional paths; empty string means "use the built-in default"
+    # (tokens.db beside clients_file / /opt/beaconmcp/audit.log).
+    tokens_db: str = ""
+    audit_log: str = ""
+    # Named-token lifetime in seconds; empty means the 30-day default.
+    named_token_ttl: str = ""
 
 
 @dataclass
@@ -203,6 +218,9 @@ def _q(value: str) -> str:
         return '""'
     if any(ch in value for ch in "!@:#&*`{}[]|>?,%"):
         return f'"{value}"'
+    # A bare "-" (or "- foo") would parse as a sequence entry, not a scalar.
+    if value == "-" or value.startswith("- "):
+        return f'"{value}"'
     if value.lower() in {"true", "false", "yes", "no", "on", "off", "null", "~"}:
         return f'"{value}"'
     return value
@@ -235,6 +253,12 @@ def render_yaml(draft: ConfigDraft) -> str:
         lines.append(f"  session_key: ${{{draft.server.session_key_env}}}")
     if draft.server.allow_dynamic_registration:
         lines.append("  allow_dynamic_registration: true")
+    if draft.server.tokens_db:
+        lines.append(f"  tokens_db: {_q(draft.server.tokens_db)}")
+    if draft.server.audit_log:
+        lines.append(f"  audit_log: {_q(draft.server.audit_log)}")
+    if draft.server.named_token_ttl:
+        lines.append(f"  named_token_ttl: {draft.server.named_token_ttl}")
     lines.append("")
 
     # Proxmox
@@ -278,6 +302,10 @@ def render_yaml(draft: ConfigDraft) -> str:
                 lines.append(f"    password: {_q(d.password_literal)}")
         if draft.ssh.inherit_proxmox_nodes:
             lines.append("  inherit_proxmox_nodes: true")
+        if draft.ssh.known_hosts:
+            lines.append(f"  known_hosts: {_q(draft.ssh.known_hosts)}")
+        if draft.ssh.strict_host_key_checking:
+            lines.append("  strict_host_key_checking: true")
         if draft.ssh.hosts:
             lines.append("  hosts:")
             for h in draft.ssh.hosts:
@@ -292,6 +320,12 @@ def render_yaml(draft: ConfigDraft) -> str:
                     lines.append(f"      password: ${{{h.password_env}}}")
                 elif h.password_literal:
                     lines.append(f"      password: {_q(h.password_literal)}")
+                if h.known_hosts:
+                    lines.append(f"      known_hosts: {_q(h.known_hosts)}")
+                if h.strict_host_key_checking in ("true", "false"):
+                    lines.append(
+                        f"      strict_host_key_checking: {h.strict_host_key_checking}"
+                    )
         lines.append("")
 
     # BMC
@@ -417,6 +451,14 @@ def load_yaml_into_draft(path: Path) -> ConfigDraft:
         draft.server.allow_dynamic_registration = bool(
             server.get("allow_dynamic_registration", False)
         )
+        draft.server.tokens_db = str(server.get("tokens_db") or "")
+        draft.server.audit_log = str(server.get("audit_log") or "")
+        # ``0`` is meaningful (never expires) -- only absence means default.
+        draft.server.named_token_ttl = (
+            str(server.get("named_token_ttl"))
+            if server.get("named_token_ttl") is not None
+            else ""
+        )
 
     proxmox = raw.get("proxmox") or {}
     if isinstance(proxmox, dict):
@@ -438,6 +480,10 @@ def load_yaml_into_draft(path: Path) -> ConfigDraft:
         draft.ssh.enabled = True
         draft.ssh.vmid_to_ip = str(ssh.get("vmid_to_ip") or "")
         draft.ssh.inherit_proxmox_nodes = bool(ssh.get("inherit_proxmox_nodes", False))
+        draft.ssh.known_hosts = str(ssh.get("known_hosts") or "")
+        draft.ssh.strict_host_key_checking = bool(
+            ssh.get("strict_host_key_checking", False)
+        )
         defaults = ssh.get("defaults") or {}
         if isinstance(defaults, dict):
             draft.ssh.defaults.user = str(defaults.get("user") or "root")
@@ -452,6 +498,7 @@ def load_yaml_into_draft(path: Path) -> ConfigDraft:
                 continue
             port = host.get("port")
             env_name, literal = _split_secret(host.get("password"))
+            strict_raw = host.get("strict_host_key_checking")
             draft.ssh.hosts.append(SSHHostDraft(
                 name=str(host.get("name") or ""),
                 host=str(host.get("host") or ""),
@@ -460,6 +507,10 @@ def load_yaml_into_draft(path: Path) -> ConfigDraft:
                 password_env=env_name,
                 password_literal=literal,
                 key_file=str(host.get("key_file") or ""),
+                known_hosts=str(host.get("known_hosts") or ""),
+                strict_host_key_checking=(
+                    "" if strict_raw is None else ("true" if strict_raw else "false")
+                ),
             ))
     else:
         # No ssh block means SSH is disabled in the saved config.
@@ -825,6 +876,24 @@ class _SSHPanel(Static):
             yield Label("Inherit PVE nodes:")
             yield Switch(value=ssh.inherit_proxmox_nodes, id="ssh-inherit")
 
+        yield Static("Host-key verification", classes="section-heading")
+        yield Static(
+            "Defaults to accept-any-key (trusted LAN). Point known_hosts at "
+            "an OpenSSH file to pin keys, or flip strict to use "
+            "~/.ssh/known_hosts. Hosts can override per-entry in their form.",
+            classes="hint",
+        )
+        with Horizontal(classes="form-row"):
+            yield Label("known_hosts:")
+            yield Input(
+                value=ssh.known_hosts,
+                placeholder="/etc/beaconmcp/known_hosts (empty = accept any)",
+                id="ssh-known-hosts",
+            )
+        with Horizontal(classes="form-row"):
+            yield Label("Strict host keys:")
+            yield Switch(value=ssh.strict_host_key_checking, id="ssh-strict")
+
         yield Static("Default credentials", classes="section-heading")
         yield Static(
             "Used for inherited Proxmox entries. Provide exactly one of "
@@ -879,12 +948,16 @@ class _SSHPanel(Static):
             self.draft.ssh.enabled = event.value
         elif event.switch.id == "ssh-inherit":
             self.draft.ssh.inherit_proxmox_nodes = event.value
+        elif event.switch.id == "ssh-strict":
+            self.draft.ssh.strict_host_key_checking = event.value
         self.on_change()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         ssh = self.draft.ssh
         if event.input.id == "ssh-vmid":
             ssh.vmid_to_ip = event.value.strip()
+        elif event.input.id == "ssh-known-hosts":
+            ssh.known_hosts = event.value.strip()
         elif event.input.id == "ssh-def-user":
             ssh.defaults.user = event.value.strip() or "root"
         elif event.input.id == "ssh-def-key":
@@ -926,7 +999,9 @@ class _SSHPanel(Static):
             title="SSH host" if idx is None else f"Edit {existing.name or 'host'}",
             hint=(
                 "key_file or password env — one of the two, not both. "
-                "Leave port empty for 22."
+                "Leave port empty for 22. known_hosts / strict host keys "
+                "(true/false) are optional overrides of the global SSH "
+                "settings; leave empty to inherit."
             ),
             fields=[
                 ("name", "name", existing.name),
@@ -935,6 +1010,12 @@ class _SSHPanel(Static):
                 ("port", "port", str(existing.port) if existing.port and existing.port != 22 else ""),
                 ("key_file", "key_file", existing.key_file),
                 ("password env", "password_env", existing.password_env),
+                ("known_hosts", "known_hosts", existing.known_hosts),
+                (
+                    "strict host keys",
+                    "strict_host_key_checking",
+                    existing.strict_host_key_checking,
+                ),
             ],
         )
 
@@ -947,6 +1028,9 @@ class _SSHPanel(Static):
             # Enforce mutual exclusion
             if key and pw:
                 pw = ""
+            strict = result["strict_host_key_checking"].strip().lower()
+            if strict not in ("true", "false"):
+                strict = ""  # inherit the global setting
             entry = SSHHostDraft(
                 name=result["name"],
                 host=result["host"],
@@ -954,6 +1038,8 @@ class _SSHPanel(Static):
                 port=port,
                 key_file=key,
                 password_env=pw,
+                known_hosts=result["known_hosts"].strip(),
+                strict_host_key_checking=strict,
             )
             if idx is None:
                 self.draft.ssh.hosts.append(entry)
@@ -1123,6 +1209,37 @@ class _ServerPanel(Static):
             "slug. Off by default.",
             classes="hint",
         )
+        yield Static(
+            "tokens_db — SQLite file persisting named API tokens across "
+            "restarts. Empty = tokens.db beside clients_file.",
+            classes="field-label",
+        )
+        yield Input(
+            value=srv.tokens_db,
+            id="srv-tokens-db",
+            placeholder="/opt/beaconmcp/tokens.db",
+        )
+        yield Static(
+            "audit_log — JSON-lines audit file. Empty = "
+            "/opt/beaconmcp/audit.log; '-' keeps stderr only.",
+            classes="field-label",
+        )
+        yield Input(
+            value=srv.audit_log,
+            id="srv-audit-log",
+            placeholder="/opt/beaconmcp/audit.log",
+        )
+        yield Static(
+            "named_token_ttl — lifetime (seconds) of named API tokens. "
+            "Empty = 30 days; 0 = never expires (revoke-only). Internal "
+            "session bearers stay 24 h.",
+            classes="field-label",
+        )
+        yield Input(
+            value=srv.named_token_ttl,
+            id="srv-named-ttl",
+            placeholder="2592000",
+        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         srv = self.draft.server
@@ -1134,6 +1251,13 @@ class _ServerPanel(Static):
                 srv.port = int(raw)
         elif event.input.id == "srv-sessionkey":
             srv.session_key_env = event.value.strip()
+        elif event.input.id == "srv-tokens-db":
+            srv.tokens_db = event.value.strip()
+        elif event.input.id == "srv-audit-log":
+            srv.audit_log = event.value.strip()
+        elif event.input.id == "srv-named-ttl":
+            raw = event.value.strip()
+            srv.named_token_ttl = raw if raw.isdigit() else ""
         self.on_change()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:

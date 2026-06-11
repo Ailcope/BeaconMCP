@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +17,50 @@ def _detect_vm_type(client: ProxmoxClient, node: str, vmid: int) -> str | None:
             continue
         if isinstance(data, dict) and data.get("status"):
             return vm_type
+    return None
+
+
+def _detect_backup_type(client: ProxmoxClient, node: str, archive: str) -> str | None:
+    """Return 'qemu' or 'lxc' for a backup volid, or None if undeterminable.
+
+    Tries cheap string heuristics first (vzdump filenames + Proxmox Backup
+    Server's ``vm/<id>`` / ``ct/<id>`` namespaces), then falls back to a
+    storage-content lookup that reads the archive's ``subtype`` -- robust
+    against renamed or non-standard archive names.
+    """
+    a = archive.lower()
+    if "vzdump-qemu-" in a or "backup/vm-" in a:
+        return "qemu"
+    if "vzdump-lxc-" in a or "backup/ct-" in a:
+        return "lxc"
+    # PBS namespaces: the guest-type segment is always followed by the
+    # numeric VMID (``backup/vm/100/...``, ``backup/ns/<ns>/ct/200/...``).
+    # Anchoring on the id avoids misreading a *namespace* named "vm"/"ct".
+    m = re.search(r"(?:^|/)(vm|ct)/\d+(?:/|$)", a)
+    if m:
+        return "qemu" if m.group(1) == "vm" else "lxc"
+
+    # Fallback: look the volid up in its source storage's content listing and
+    # read the type Proxmox itself reports.
+    src_storage = archive.split(":", 1)[0] if ":" in archive else ""
+    if not src_storage:
+        return None
+    content = client.get(
+        node, f"nodes/{node}/storage/{src_storage}/content", content="backup",
+    )
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict) or item.get("volid") != archive:
+            continue
+        subtype = (item.get("subtype") or item.get("vmtype") or "").lower()
+        if subtype in ("qemu", "lxc"):
+            return subtype
+        fmt = (item.get("format") or "").lower()
+        if "vma" in fmt or "qemu" in fmt:
+            return "qemu"
+        if "tar" in fmt or "lxc" in fmt:
+            return "lxc"
     return None
 
 
@@ -343,12 +388,16 @@ def register_vm_tools(mcp: FastMCP, client: ProxmoxClient) -> None:
             force: If True, overwrites an existing VM/CT if it already exists.
             storage: Target storage for the restored disks (default 'local-lvm').
         """
-        if "vzdump-qemu-" in archive:
-            endpoint = f"nodes/{node}/qemu"
-        elif "vzdump-lxc-" in archive:
-            endpoint = f"nodes/{node}/lxc"
-        else:
-            return {"status": "error", "error": "Could not determine if backup is for 'qemu' or 'lxc'. Archive must contain 'vzdump-qemu-' or 'vzdump-lxc-'."}
+        guest_type = _detect_backup_type(client, node, archive)
+        if guest_type is None:
+            return {
+                "status": "error",
+                "error": (
+                    "Could not determine if the backup is for 'qemu' or 'lxc'. "
+                    "Pass a volid from proxmox_backup_list (its 'volid' field)."
+                ),
+            }
+        endpoint = f"nodes/{node}/{guest_type}"
 
         params = {
             "vmid": vmid,

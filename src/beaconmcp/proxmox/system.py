@@ -94,6 +94,47 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# Hard cap for the guest-agent file-read path (matches proxmox_write_file).
+_FILE_READ_MAX_BYTES = 1024 * 1024
+
+
+def _qemu_file_size(client: ProxmoxClient, node: str, vmid: int, path: str) -> int | None:
+    """Best-effort size (bytes) of ``path`` inside a QEMU VM via the guest agent.
+
+    Returns ``None`` when the size can't be determined (no ``stat`` in the
+    guest, agent error, slow exec). Callers use this to reject oversized
+    reads *before* pulling the whole file into memory; ``None`` means
+    "couldn't check" so the caller falls back to its post-read guard rather
+    than blocking a legitimate read.
+    """
+    start = client.post(
+        node, f"nodes/{node}/qemu/{vmid}/agent/exec",
+        command=["stat", "-c", "%s", path],
+    )
+    if not isinstance(start, dict) or start.get("pid") is None:
+        return None
+    pid = start["pid"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        status = client.get(
+            node, f"nodes/{node}/qemu/{vmid}/agent/exec-status", pid=pid,
+        )
+        if not isinstance(status, dict):
+            return None
+        if status.get("exited"):
+            if status.get("exitcode") != 0:
+                return None
+            out = status.get("out-data", "")
+            if status.get("out-data-encoding") == "base64" and out:
+                out = base64.b64decode(out).decode("utf-8", errors="replace")
+            try:
+                return int(str(out).strip())
+            except (ValueError, AttributeError):
+                return None
+        time.sleep(0.5)
+    return None
+
+
 def register_system_tools(mcp: FastMCP, client: ProxmoxClient, ssh_client: Any = None) -> None:
     """Register Proxmox system administration and command execution tools."""
 
@@ -110,6 +151,20 @@ def register_system_tools(mcp: FastMCP, client: ProxmoxClient, ssh_client: Any =
             return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
             
         if vm_type == "qemu":
+            # Pre-flight: refuse oversized files before the guest agent pulls
+            # the whole thing into memory. Best-effort -- if the guest has no
+            # `stat` we fall through to the post-read guard below.
+            size = await asyncio.get_running_loop().run_in_executor(
+                None, _qemu_file_size, client, node, vmid, path,
+            )
+            if size is not None and size > _FILE_READ_MAX_BYTES:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"File is {size} bytes, over the 1MB guest-agent read "
+                        "limit. Use proxmox_download_file for large files."
+                    ),
+                }
             result = client.get(node, f"nodes/{node}/qemu/{vmid}/agent/file-read", file=path)
             if isinstance(result, dict) and "error" in result:
                 return {"status": "error", "error": result["error"]}

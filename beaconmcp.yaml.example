@@ -68,6 +68,26 @@ server:
   transfers_dir: ~/.cache/beaconmcp/transfers
   transfers_max_mb: 500
 
+  # SQLite file persisting *named* API tokens (the ones minted on the
+  # dashboard's "API tokens" page) across restarts. Defaults to `tokens.db`
+  # next to `clients_file`. Created owner-only (0600). The
+  # BEACONMCP_TOKENS_DB env var overrides this.
+  # tokens_db: /opt/beaconmcp/tokens.db
+
+  # JSON-lines audit log: every MCP tool call, dashboard login, OAuth
+  # authorize and client revoke. Defaults to /opt/beaconmcp/audit.log;
+  # set to "-" to disable the file and keep stderr only. Created
+  # owner-only (0600). The BEACONMCP_AUDIT_LOG env var overrides this.
+  # audit_log: /opt/beaconmcp/audit.log
+
+  # Lifetime (seconds) of *named* API tokens minted on the dashboard's
+  # "API tokens" page. They persist across restarts, so the default is
+  # 30 days (2592000) rather than the 24 h used for internal OAuth/session
+  # bearers. Set to 0 for tokens that never expire (revoke-only -- make
+  # sure you trust every client you paste one into). The
+  # BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
+  # named_token_ttl: 2592000
+
 # -------- Proxmox capability (optional) ------------------------------------
 # Delete this section if you have no Proxmox cluster. Tools starting with
 # `proxmox_` won't be registered.
@@ -142,6 +162,15 @@ ssh:
       port: 22                          # optional, defaults to 22
       user: root
       key_file: ~/.ssh/id_ed25519       # OR `password:`, not both
+      # Per-host host-key overrides; unset fields inherit the global
+      # `ssh.known_hosts` / `ssh.strict_host_key_checking` above. Handy to
+      # enforce strict checking on one public-internet host while
+      # trusted-LAN nodes stay permissive. Note: overrides only *tighten* —
+      # once a global `known_hosts` file is set, a per-host
+      # `strict_host_key_checking: false` cannot loosen back to
+      # accept-any-key.
+      # known_hosts: /etc/beaconmcp/vps1_known_hosts
+      # strict_host_key_checking: true
 
     - name: vps2
       host: 198.51.100.11

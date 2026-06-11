@@ -20,6 +20,8 @@ from .ssh.tools import register_ssh_tools
 
 from functools import wraps
 import time
+from . import audit
+from .auth import current_client_id
 from .metrics import tool_calls, tool_latency_ms
 
 config = Config.load()
@@ -143,7 +145,12 @@ def _metric_tool(*args, **kwargs):
                 latency = (time.monotonic() - start) * 1000
                 tool_calls.inc(tool=tool_name, status=status)
                 tool_latency_ms.observe(latency, tool=tool_name)
-        
+                audit.emit(
+                    "tool.call", tool=tool_name, status=status,
+                    duration_ms=round(latency, 1),
+                    client_id=current_client_id(), args=audit.compact_args(f_kwargs),
+                )
+
         @wraps(func)
         def sync_wrapper(*f_args, **f_kwargs):
             start = time.monotonic()
@@ -157,6 +164,11 @@ def _metric_tool(*args, **kwargs):
                 latency = (time.monotonic() - start) * 1000
                 tool_calls.inc(tool=tool_name, status=status)
                 tool_latency_ms.observe(latency, tool=tool_name)
+                audit.emit(
+                    "tool.call", tool=tool_name, status=status,
+                    duration_ms=round(latency, 1),
+                    client_id=current_client_id(), args=audit.compact_args(f_kwargs),
+                )
                 
         
         import inspect

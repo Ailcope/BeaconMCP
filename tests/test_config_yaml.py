@@ -635,3 +635,84 @@ def test_get_ssh_host_accessors(
     assert cfg.get_ssh_host("missing") is None
     assert cfg.get_ssh_host_by_address("198.51.100.10") is not None
     assert cfg.get_ssh_host_by_address("10.0.0.1") is None
+
+
+def test_ssh_per_host_host_key_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VPS_PW", "pw")
+    path = _write(
+        tmp_path / "beaconmcp.yaml",
+        """
+        version: 1
+        ssh:
+          known_hosts: /etc/beaconmcp/known_hosts
+          strict_host_key_checking: true
+          hosts:
+            - name: lan-node
+              host: 10.0.0.1
+              user: root
+              password: ${VPS_PW}
+            - name: vps
+              host: 198.51.100.10
+              user: root
+              password: ${VPS_PW}
+              known_hosts: /etc/beaconmcp/vps_known_hosts
+              strict_host_key_checking: false
+        """,
+    )
+    cfg = Config.load(config_path=path)
+    lan = cfg.get_ssh_host("lan-node")
+    assert lan is not None
+    # Unset per-host fields stay None so the SSH client inherits the globals.
+    assert lan.known_hosts is None
+    assert lan.strict_host_key_checking is None
+    vps = cfg.get_ssh_host("vps")
+    assert vps is not None
+    assert vps.known_hosts == "/etc/beaconmcp/vps_known_hosts"
+    assert vps.strict_host_key_checking is False
+
+
+def test_server_tokens_db_and_audit_log_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VPS_PW", "pw")
+    path = _write(
+        tmp_path / "beaconmcp.yaml",
+        """
+        version: 1
+        server:
+          tokens_db: /var/lib/beaconmcp/tokens.db
+          audit_log: "-"
+        ssh:
+          hosts:
+            - name: vps1
+              host: 198.51.100.10
+              user: root
+              password: ${VPS_PW}
+        """,
+    )
+    cfg = Config.load(config_path=path)
+    assert cfg.server.tokens_db == Path("/var/lib/beaconmcp/tokens.db")
+    assert cfg.server.audit_log == "-"
+
+
+def test_server_tokens_db_and_audit_log_default_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VPS_PW", "pw")
+    path = _write(
+        tmp_path / "beaconmcp.yaml",
+        """
+        version: 1
+        ssh:
+          hosts:
+            - name: vps1
+              host: 198.51.100.10
+              user: root
+              password: ${VPS_PW}
+        """,
+    )
+    cfg = Config.load(config_path=path)
+    assert cfg.server.tokens_db is None
+    assert cfg.server.audit_log is None

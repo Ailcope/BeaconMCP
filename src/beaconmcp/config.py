@@ -143,6 +143,14 @@ class ServerConfig:
     # Hard cap (MB) for large-file transfer tools. Sized for typical config
     # / blob payloads; raise if you regularly move ISO-grade artefacts.
     transfers_max_mb: int = 500
+    # SQLite file persisting *named* API tokens across restarts (see
+    # ``auth.TokenStore``). ``None`` means ``tokens.db`` next to
+    # ``clients_file``. The BEACONMCP_TOKENS_DB env var overrides this.
+    tokens_db: Path | None = None
+    # JSON-lines audit log path. ``None`` means ``/opt/beaconmcp/audit.log``;
+    # set to ``-`` to disable the file and keep stderr only. The
+    # BEACONMCP_AUDIT_LOG env var overrides this.
+    audit_log: str | None = None
 
 
 @dataclass
@@ -505,6 +513,14 @@ class Config:
                 )
             ),
             transfers_max_mb=int(srv_raw.get("transfers_max_mb", 500)),
+            tokens_db=(
+                Path(os.path.expanduser(str(srv_raw["tokens_db"])))
+                if srv_raw.get("tokens_db")
+                else None
+            ),
+            audit_log=(
+                str(srv_raw["audit_log"]) if srv_raw.get("audit_log") else None
+            ),
         )
 
         feat_raw = raw.get("features") or {}
@@ -639,6 +655,13 @@ class Config:
                 "allow_dynamic_registration": self.server.allow_dynamic_registration,
                 "transfers_dir": str(self.server.transfers_dir),
                 "transfers_max_mb": self.server.transfers_max_mb,
+                "tokens_db": (
+                    str(self.server.tokens_db)
+                    if self.server.tokens_db
+                    else "(default: tokens.db beside clients_file)"
+                ),
+                "audit_log": self.server.audit_log
+                or "(default: /opt/beaconmcp/audit.log)",
             },
             "proxmox": {
                 "verify_ssl": self.verify_ssl,

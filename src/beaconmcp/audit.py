@@ -49,6 +49,31 @@ def _redact(value: Any) -> Any:
     return value
 
 
+# Tool-arg keys that carry free-form payloads (file contents, shell command
+# lines). Their values routinely embed secrets that key-based redaction
+# cannot see (``content="DB_PASSWORD=..."``), so :func:`compact_args` always
+# collapses them to a length marker regardless of size.
+_CONTENT_KEYS = frozenset({"content", "command", "script"})
+
+
+def compact_args(kwargs: dict) -> dict:
+    """Compact, log-safe view of tool kwargs.
+
+    Long strings are collapsed to ``<str:N chars>``; content-bearing keys
+    (:data:`_CONTENT_KEYS`) are collapsed unconditionally so shell command
+    lines and file payloads never reach the audit sink verbatim.
+    """
+    out = {}
+    for k, v in kwargs.items():
+        if isinstance(v, str) and (
+            len(v) > 120 or k.lower() in _CONTENT_KEYS
+        ):
+            out[k] = f"<str:{len(v)} chars>"
+        else:
+            out[k] = v
+    return out
+
+
 def emit(event: str, **fields: Any) -> None:
     """Write one audit event as a JSON line.
 
@@ -61,8 +86,10 @@ def emit(event: str, **fields: Any) -> None:
             "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
             "event": event,
         }
-        for k, v in fields.items():
-            record[k] = _redact(v)
+        # Run the fields through _redact as a dict so top-level keys get
+        # the same masking as nested ones (emit("x", totp=...) must not
+        # log the code).
+        record.update(_redact(dict(fields)))
         _logger.info(json.dumps(record, default=str, ensure_ascii=False))
     except Exception:  # noqa: BLE001  -- audit must never break a request
         pass

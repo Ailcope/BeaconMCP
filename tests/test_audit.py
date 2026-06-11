@@ -39,3 +39,31 @@ def test_emit_never_raises(monkeypatch) -> None:
     monkeypatch.setattr(audit._logger, "info", boom)
     # Should swallow the exception -- audit must never break a request.
     audit.emit("anything", x=1)
+
+
+def test_redacts_top_level_fields(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="beaconmcp.audit"):
+        audit.emit("auth.authorize.ok", client_id="c1", totp="123456")
+    data = json.loads(caplog.records[-1].getMessage())
+    assert data["client_id"] == "c1"
+    assert data["totp"] == "***"
+
+
+def test_compact_args_collapses_long_strings() -> None:
+    out = audit.compact_args({"node": "pve1", "blob": "x" * 500})
+    assert out["node"] == "pve1"
+    assert out["blob"] == "<str:500 chars>"
+
+
+def test_compact_args_always_collapses_content_keys() -> None:
+    # Short command lines / file payloads can embed secrets that key-based
+    # redaction cannot see -- they must never reach the sink verbatim.
+    out = audit.compact_args({
+        "command": "mysql -u root -phunter2 db",
+        "content": "DB_PASSWORD=hunter2",
+        "path": "/root/.env",
+    })
+    assert "hunter2" not in str(out)
+    assert out["command"] == "<str:26 chars>"
+    assert out["content"] == "<str:19 chars>"
+    assert out["path"] == "/root/.env"

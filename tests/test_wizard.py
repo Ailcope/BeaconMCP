@@ -96,3 +96,19 @@ ssh:
     assert draft.ssh.strict_host_key_checking is False
     assert draft.ssh.hosts[0].known_hosts == ""
     assert draft.ssh.hosts[0].strict_host_key_checking == ""
+
+
+def test_named_token_ttl_zero_round_trips(tmp_path: Path) -> None:
+    cfg = tmp_path / "beaconmcp.yaml"
+    cfg.write_text(
+        """
+version: 1
+server:
+  named_token_ttl: 0
+""".lstrip(),
+        encoding="utf-8",
+    )
+    draft = load_yaml_into_draft(cfg)
+    # 0 means "never expires" -- it must not be dropped as falsy.
+    assert draft.server.named_token_ttl == "0"
+    assert "named_token_ttl: 0" in render_yaml(draft)

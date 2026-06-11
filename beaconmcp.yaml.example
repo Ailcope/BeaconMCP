@@ -83,7 +83,9 @@ server:
   # Lifetime (seconds) of *named* API tokens minted on the dashboard's
   # "API tokens" page. They persist across restarts, so the default is
   # 30 days (2592000) rather than the 24 h used for internal OAuth/session
-  # bearers. The BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
+  # bearers. Set to 0 for tokens that never expire (revoke-only -- make
+  # sure you trust every client you paste one into). The
+  # BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
   # named_token_ttl: 2592000
 
 # -------- Proxmox capability (optional) ------------------------------------

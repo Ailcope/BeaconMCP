@@ -443,8 +443,10 @@ class TokenStore:
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
         # Effective named-token lifetime: explicit value wins, else default.
+        # ``0`` is a deliberate setting (tokens never expire, revoke-only),
+        # so only ``None`` falls back to the 30-day default.
         self.named_token_ttl = (
-            named_token_ttl if named_token_ttl else self.NAMED_TOKEN_TTL
+            named_token_ttl if named_token_ttl is not None else self.NAMED_TOKEN_TTL
         )
         if db_path is not None:
             self._init_db(Path(db_path))
@@ -527,14 +529,16 @@ class TokenStore:
                     f"{self.NAMED_TOKEN_CAP} named tokens"
                 )
         # Named tokens get the (longer, configurable) named lifetime; internal
-        # session bearers keep the short 24 h TTL.
+        # session bearers keep the short 24 h TTL. A named TTL of 0 means
+        # "never expires": the token lives until explicitly revoked.
         ttl = self.named_token_ttl if name is not None else self.TOKEN_TTL
         token = secrets.token_hex(32)
         now = time.time()
+        expires_at = float("inf") if (name is not None and ttl == 0) else now + ttl
         at = AccessToken(
             token=token,
             client_id=client_id,
-            expires_at=now + ttl,
+            expires_at=expires_at,
             name=name,
             created_at=now,
         )

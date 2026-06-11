@@ -769,7 +769,7 @@ headers = { "Authorization" = "Bearer &lt;token&gt;" }</code></pre>
           <p>
             Any client that can send <code>Authorization: Bearer …</code> on HTTP POST works. Mint
             a token, point the client at <code>{{ mcp_url }}</code>, and attach the bearer on
-            every request. Named tokens live {{ named_ttl_days }} day{{ 's' if named_ttl_days != 1 }} and
+            every request. Named tokens live {{ named_ttl_label }} and
             survive restarts — revoke them here any time.
           </p>
         </article>

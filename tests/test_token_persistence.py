@@ -92,6 +92,25 @@ def test_named_ttl_defaults_to_30_days(tmp_path: Path) -> None:
     assert expires_in == TokenStore.NAMED_TOKEN_TTL == 3600 * 24 * 30
 
 
+def test_named_ttl_zero_means_no_expiry(tmp_path: Path) -> None:
+    db = tmp_path / "tokens.db"
+    store = TokenStore(db_path=db, named_token_ttl=0)
+    token, expires_in = store.issue("client-a", name="forever")
+    assert expires_in == 0
+    assert store.validate(token) == "client-a"
+    # Internal session bearers are unaffected by the named TTL.
+    _, session_ttl = store.issue("client-a")
+    assert session_ttl == TokenStore.TOKEN_TTL
+
+    # The infinite expiry must survive the SQLite round-trip.
+    reborn = TokenStore(db_path=db, named_token_ttl=0)
+    assert reborn.validate(token) == "client-a"
+    # And revocation must still kill it.
+    assert reborn.revoke(token) is True
+    final = TokenStore(db_path=db, named_token_ttl=0)
+    assert final.validate(token) is None
+
+
 def test_unwritable_db_degrades_to_memory_only(tmp_path: Path) -> None:
     target = tmp_path / "blocked"
     target.write_text("not a directory")

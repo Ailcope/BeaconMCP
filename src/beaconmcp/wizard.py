@@ -453,9 +453,10 @@ def load_yaml_into_draft(path: Path) -> ConfigDraft:
         )
         draft.server.tokens_db = str(server.get("tokens_db") or "")
         draft.server.audit_log = str(server.get("audit_log") or "")
+        # ``0`` is meaningful (never expires) -- only absence means default.
         draft.server.named_token_ttl = (
             str(server.get("named_token_ttl"))
-            if server.get("named_token_ttl")
+            if server.get("named_token_ttl") is not None
             else ""
         )
 
@@ -1230,7 +1231,8 @@ class _ServerPanel(Static):
         )
         yield Static(
             "named_token_ttl — lifetime (seconds) of named API tokens. "
-            "Empty = 30 days. Internal session bearers stay 24 h.",
+            "Empty = 30 days; 0 = never expires (revoke-only). Internal "
+            "session bearers stay 24 h.",
             classes="field-label",
         )
         yield Input(

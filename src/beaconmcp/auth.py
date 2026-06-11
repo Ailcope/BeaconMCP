@@ -442,6 +442,9 @@ class TokenStore:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(path), check_same_thread=False)
+            # Raw bearer tokens live in this file -- owner-only, like
+            # clients.json (sqlite3 creates it with the default umask).
+            os.chmod(path, 0o600)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS named_tokens ("
                 " token TEXT PRIMARY KEY,"

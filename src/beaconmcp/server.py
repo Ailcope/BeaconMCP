@@ -24,17 +24,6 @@ from . import audit
 from .auth import current_client_id
 from .metrics import tool_calls, tool_latency_ms
 
-
-def _audit_args(kwargs: dict) -> dict:
-    """Compact, log-safe view of tool kwargs (long strings collapsed)."""
-    out = {}
-    for k, v in kwargs.items():
-        if isinstance(v, str) and len(v) > 120:
-            out[k] = f"<str:{len(v)} chars>"
-        else:
-            out[k] = v
-    return out
-
 config = Config.load()
 proxmox_client = ProxmoxClient(config)
 ssh_client = SSHClient(config)
@@ -159,7 +148,7 @@ def _metric_tool(*args, **kwargs):
                 audit.emit(
                     "tool.call", tool=tool_name, status=status,
                     duration_ms=round(latency, 1),
-                    client_id=current_client_id(), args=_audit_args(f_kwargs),
+                    client_id=current_client_id(), args=audit.compact_args(f_kwargs),
                 )
 
         @wraps(func)
@@ -178,7 +167,7 @@ def _metric_tool(*args, **kwargs):
                 audit.emit(
                     "tool.call", tool=tool_name, status=status,
                     duration_ms=round(latency, 1),
-                    client_id=current_client_id(), args=_audit_args(f_kwargs),
+                    client_id=current_client_id(), args=audit.compact_args(f_kwargs),
                 )
                 
         

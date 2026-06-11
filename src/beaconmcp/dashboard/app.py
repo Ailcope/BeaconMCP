@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
+from .. import audit
 from . import csrf as csrf
 from .chat import (
     ChatEngine,
@@ -319,6 +321,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
 
         if not deps.client_store.verify_totp(client_id, totp):  # type: ignore[attr-defined]
             deps.totp_record_failure(client_id)
+            audit.emit("dashboard.login.fail", client_id=client_id, reason="totp")
             return _fail(
                 "Invalid 2FA code. Check that your device clock is in sync.",
                 status=401,
@@ -326,6 +329,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
             )
 
         deps.totp_record_success(client_id)
+        audit.emit("dashboard.login.ok", client_id=client_id)
         bearer, ttl = deps.token_store.issue(client_id)  # type: ignore[attr-defined]
         ua = request.headers.get("user-agent", "")[:200]
         session = deps.session_store.create(
@@ -717,6 +721,10 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
             # Only allow revoking clients WE own.
             if target is not None and target.owner_client_id == session.client_id:
                 deps.client_store.revoke(client_id)  # type: ignore[attr-defined]
+                audit.emit(
+                    "auth.client.revoke", client_id=client_id,
+                    owner_client_id=session.client_id, via="dashboard",
+                )
         return RedirectResponse("/app/connectors", status_code=303)
 
     async def tokens_revoke(request: Request) -> Response:
@@ -1146,18 +1154,40 @@ def _render_tokens_page(
     """Render the /app/tokens page (list + create form)."""
     tokens_raw = deps.token_store.list_named(session.client_id)  # type: ignore[attr-defined]
     now = time.time()
+    def _expires_label(expires_at: float) -> str:
+        if math.isinf(expires_at):
+            return "never expires (revoke-only)"
+        secs = max(0, expires_at - now)
+        if secs >= 48 * 3600:
+            return f"expires in {round(secs / 86400)} days"
+        return f"expires in {max(0, round(secs / 3600, 1))} h"
+
     tokens = [
         {
             "name": t.name,
             "prefix": t.token[:12],
             "created_at": t.created_at,
             "expires_at": t.expires_at,
-            "expires_in_hours": max(0, round((t.expires_at - now) / 3600, 1)),
+            "expires_in_hours": (
+                None if math.isinf(t.expires_at)
+                else max(0, round((t.expires_at - now) / 3600, 1))
+            ),
+            "expires_label": _expires_label(t.expires_at),
         }
         for t in tokens_raw
     ]
     count = len(tokens)
     cap = getattr(deps.token_store, "NAMED_TOKEN_CAP", 3)
+    # Named-token lifetime for the page copy. A TTL of 0 means
+    # "never expires" -- the token lives until revoked.
+    named_ttl_seconds = getattr(
+        deps.token_store, "named_token_ttl", 24 * 3600,
+    )
+    if named_ttl_seconds == 0:
+        named_ttl_label = "until revoked (no expiry)"
+    else:
+        days = max(1, round(named_ttl_seconds / 86400))
+        named_ttl_label = f"{days} day{'s' if days != 1 else ''}"
 
     client_name = (
         deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
@@ -1184,6 +1214,7 @@ def _render_tokens_page(
         tokens=tokens,
         count=count,
         cap=cap,
+        named_ttl_label=named_ttl_label,
         can_create=count < cap,
         form_error=form_error,
         form_name=form_name,

@@ -65,6 +65,12 @@ class SSHHost:
     port: int = 22
     password: str | None = None
     key_file: str | None = None
+    # Per-host host-key verification overrides. When unset (None) the host
+    # inherits the global ``ssh.known_hosts`` / ``ssh.strict_host_key_checking``
+    # settings. Set these on a single host (e.g. a public-internet VPS) to
+    # enforce strict checking there while trusted-LAN nodes stay permissive.
+    known_hosts: str | None = None
+    strict_host_key_checking: bool | None = None
 
 
 @dataclass
@@ -137,6 +143,19 @@ class ServerConfig:
     # Hard cap (MB) for large-file transfer tools. Sized for typical config
     # / blob payloads; raise if you regularly move ISO-grade artefacts.
     transfers_max_mb: int = 500
+    # SQLite file persisting *named* API tokens across restarts (see
+    # ``auth.TokenStore``). ``None`` means ``tokens.db`` next to
+    # ``clients_file``. The BEACONMCP_TOKENS_DB env var overrides this.
+    tokens_db: Path | None = None
+    # JSON-lines audit log path. ``None`` means ``/opt/beaconmcp/audit.log``;
+    # set to ``-`` to disable the file and keep stderr only. The
+    # BEACONMCP_AUDIT_LOG env var overrides this.
+    audit_log: str | None = None
+    # Lifetime, in seconds, of *named* API tokens (dashboard ``/app/tokens``).
+    # ``None`` means the ``auth.TokenStore`` default (30 days). Internal
+    # session bearers always use the fixed 24 h TTL. The
+    # BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
+    named_token_ttl: int | None = None
 
 
 @dataclass
@@ -428,6 +447,7 @@ class Config:
                     )
                 host_addr = _required(h, "host", f"ssh.hosts[{host_name}]")
                 seen_addresses.add(host_addr)
+                host_strict_raw = h.get("strict_host_key_checking")
                 ssh_hosts.append(
                     SSHHost(
                         name=host_name,
@@ -436,6 +456,11 @@ class Config:
                         port=int(h.get("port", 22)),
                         password=password,
                         key_file=key_file,
+                        known_hosts=h.get("known_hosts") or None,
+                        strict_host_key_checking=(
+                            None if host_strict_raw is None
+                            else _bool(host_strict_raw)
+                        ),
                     )
                 )
 
@@ -493,7 +518,25 @@ class Config:
                 )
             ),
             transfers_max_mb=int(srv_raw.get("transfers_max_mb", 500)),
+            tokens_db=(
+                Path(os.path.expanduser(str(srv_raw["tokens_db"])))
+                if srv_raw.get("tokens_db")
+                else None
+            ),
+            audit_log=(
+                str(srv_raw["audit_log"]) if srv_raw.get("audit_log") else None
+            ),
+            named_token_ttl=(
+                int(srv_raw["named_token_ttl"])
+                if srv_raw.get("named_token_ttl") is not None
+                else None
+            ),
         )
+        if server.named_token_ttl is not None and server.named_token_ttl < 0:
+            raise ConfigError(
+                "server.named_token_ttl: must be >= 0 seconds "
+                "(0 = named tokens never expire, revoke-only)."
+            )
 
         feat_raw = raw.get("features") or {}
         dash_raw = feat_raw.get("dashboard") or {}
@@ -627,6 +670,22 @@ class Config:
                 "allow_dynamic_registration": self.server.allow_dynamic_registration,
                 "transfers_dir": str(self.server.transfers_dir),
                 "transfers_max_mb": self.server.transfers_max_mb,
+                "tokens_db": (
+                    str(self.server.tokens_db)
+                    if self.server.tokens_db
+                    else "(default: tokens.db beside clients_file)"
+                ),
+                "audit_log": self.server.audit_log
+                or "(default: /opt/beaconmcp/audit.log)",
+                "named_token_ttl": (
+                    "(default: 30 days)"
+                    if self.server.named_token_ttl is None
+                    else (
+                        "0 (never expires, revoke-only)"
+                        if self.server.named_token_ttl == 0
+                        else self.server.named_token_ttl
+                    )
+                ),
             },
             "proxmox": {
                 "verify_ssl": self.verify_ssl,

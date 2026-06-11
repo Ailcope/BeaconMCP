@@ -18,15 +18,54 @@ def _configure_logging() -> None:
     entry before any module-level ``_logger`` call can fire. Keeps the
     format compact so journalctl stays readable.
     """
-    if logging.getLogger().handlers:
-        return  # already configured (e.g. pytest, embedded use)
-    level_name = os.environ.get("BEACONMCP_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    if not logging.getLogger().handlers:
+        level_name = os.environ.get("BEACONMCP_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            stream=sys.stderr,
+        )
+
+
+def _configure_audit_log(config_path: str | None = None) -> None:
+    """Route the ``beaconmcp.audit`` logger to a dedicated JSON-lines file.
+
+    Resolution order: ``BEACONMCP_AUDIT_LOG`` env var, then
+    ``server.audit_log`` from the YAML (``config_path``), then
+    ``/opt/beaconmcp/audit.log``. Each :func:`beaconmcp.audit.emit` call
+    already produces one JSON object, so the handler uses a bare
+    ``%(message)s`` formatter. ``propagate`` is left on so the same line
+    still reaches journalctl; set the value to ``-`` to disable the file
+    and keep stderr only.
+
+    Called by the commands that emit audit events (``serve``, ``auth
+    revoke``) rather than at import, so a plain ``--help`` or
+    ``validate-config`` never touches /opt.
+    """
+    audit_logger = logging.getLogger("beaconmcp.audit")
+    if any(isinstance(h, logging.FileHandler) for h in audit_logger.handlers):
+        return  # already wired
+    path = (
+        os.environ.get("BEACONMCP_AUDIT_LOG")
+        or config_path
+        or "/opt/beaconmcp/audit.log"
+    ).strip()
+    if not path or path == "-":
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(path, encoding="utf-8")
+        # Client ids, source IPs and tool args land in here -- owner-only,
+        # like clients.json (FileHandler creates it with the default umask).
+        os.chmod(path, 0o600)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(handler)
+        audit_logger.setLevel(logging.INFO)
+    except Exception:  # noqa: BLE001 -- audit file is best-effort
+        logging.getLogger("beaconmcp").warning(
+            "could not open audit log at %s; auditing to stderr only", path,
+        )
 
 
 _configure_logging()
@@ -245,6 +284,7 @@ def _cmd_validate_config(args):
 def _cmd_serve(args):
     from .server import config, mcp
 
+    _configure_audit_log(config.server.audit_log)
     cli_host = getattr(args, "host", None)
     cli_port = getattr(args, "port", None)
     host = cli_host or os.environ.get("BEACONMCP_HOST") or config.server.host
@@ -302,7 +342,19 @@ def _cmd_auth(args):
         print()
 
     elif args.auth_command == "revoke":
+        from . import audit
+
+        # Best-effort: pick up server.audit_log when a YAML is reachable so
+        # the revoke lands in the same file as the server's events. `auth`
+        # must keep working without any config (legacy env deployments).
+        try:
+            from .config import Config
+
+            _configure_audit_log(Config.load().server.audit_log)
+        except Exception:  # noqa: BLE001
+            _configure_audit_log()
         if store.revoke(args.client_id):
+            audit.emit("auth.client.revoke", client_id=args.client_id, via="cli")
             print(f"Client {args.client_id} revoked.")
         else:
             print(f"Client {args.client_id} not found.")
@@ -369,7 +421,25 @@ def _run_http(mcp, host: str, port: int):
     env_cf = os.environ.get("BEACONMCP_CLIENTS_FILE")
     clients_path = Path(env_cf) if env_cf else config.server.clients_file
     client_store = ClientStore(clients_path)
-    token_store = TokenStore()
+    # Persist named API tokens so a restart/redeploy no longer silently
+    # invalidates tokens users pasted into external clients. Resolution:
+    # BEACONMCP_TOKENS_DB env var > server.tokens_db in the YAML >
+    # tokens.db next to clients.json.
+    env_tokens_db = os.environ.get("BEACONMCP_TOKENS_DB")
+    tokens_db = (
+        Path(env_tokens_db)
+        if env_tokens_db
+        else (config.server.tokens_db or clients_path.parent / "tokens.db")
+    )
+    # Named-token lifetime: BEACONMCP_NAMED_TOKEN_TTL env (seconds) >
+    # server.named_token_ttl in the YAML > TokenStore default (30 days).
+    env_named_ttl = os.environ.get("BEACONMCP_NAMED_TOKEN_TTL")
+    named_token_ttl = (
+        int(env_named_ttl)
+        if env_named_ttl and env_named_ttl.isdigit()
+        else config.server.named_token_ttl
+    )
+    token_store = TokenStore(db_path=tokens_db, named_token_ttl=named_token_ttl)
     code_store = CodeStore()
     # Share the TokenStore with MCP tools so security_end_session can revoke
     # the caller's bearer without an import cycle.
@@ -791,12 +861,20 @@ h1 {{ margin: 0 0 4px; font-size: 22px; font-weight: 600; letter-spacing: -0.015
         code_totp = body.get("totp", "")
         if not client_store.verify_totp(client_id, code_totp):
             totp_record_failure(client_id)
+            audit.emit(
+                "auth.authorize.fail", client_id=client_id,
+                ip=client_ip(request, tuple(config.server.trusted_proxies)),
+            )
             return _render_authorize_form(
                 normalized,
                 error="Incorrect code. Check that your device clock is in sync.",
                 locked=totp_locked(client_id),
             )
         totp_record_success(client_id)
+        audit.emit(
+            "auth.authorize.ok", client_id=client_id,
+            ip=client_ip(request, tuple(config.server.trusted_proxies)),
+        )
 
         redirect_uri = normalized["redirect_uri"]
         code = code_store.issue(

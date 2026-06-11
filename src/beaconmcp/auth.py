@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
+import threading
 import time
 from collections.abc import Iterable
 
@@ -62,6 +64,19 @@ def revoke_current_token() -> bool:
     if not token or _active_token_store is None:
         return False
     return _active_token_store.revoke(token)
+
+
+def current_client_id() -> str | None:
+    """Resolve the client_id behind the in-flight request's bearer token.
+
+    Returns ``None`` outside an HTTP request context (e.g. CLI use) or when
+    no token store is registered. Used by the audit log to attribute MCP
+    tool calls to the client that made them.
+    """
+    token = current_bearer_token.get()
+    if not token or _active_token_store is None:
+        return None
+    return _active_token_store.validate(token)
 
 
 CLIENTS_FILE = Path("/opt/beaconmcp/clients.json")
@@ -398,16 +413,105 @@ class TokenCapExceeded(Exception):
 
 
 class TokenStore:
-    """In-memory access token store with expiration."""
+    """Access token store with expiration and optional named-token persistence.
 
-    TOKEN_TTL = 3600 * 24  # 24 hours
+    Internal (unnamed) bearers live only in memory -- a re-login or restart
+    is expected to drop them. *Named* tokens (the ones a human mints on the
+    dashboard "API tokens" page and pastes into an external client) are
+    persisted to a small SQLite file when ``db_path`` is given, so a
+    ``systemctl restart`` / redeploy no longer silently invalidates them.
+    """
+
+    TOKEN_TTL = 3600 * 24  # 24 hours -- internal/session bearers
+    # Default lifetime for *named* tokens. They survive restarts (see the
+    # persistence block), so a 24 h cap defeats the point of a token pasted
+    # into an external client -- 30 days is the sensible default. Overridable
+    # per-deployment via ``named_token_ttl`` (server.named_token_ttl / env).
+    NAMED_TOKEN_TTL = 3600 * 24 * 30  # 30 days
     # Cap on named tokens (the ones listed in the dashboard's API
     # tokens page). Internal dashboard-session bearers are unlimited
     # because a re-login always revokes the prior one.
     NAMED_TOKEN_CAP = 3
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        named_token_ttl: int | None = None,
+    ) -> None:
         self._tokens: dict[str, AccessToken] = {}
+        self._db: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
+        # Effective named-token lifetime: explicit value wins, else default.
+        # ``0`` is a deliberate setting (tokens never expire, revoke-only),
+        # so only ``None`` falls back to the 30-day default.
+        self.named_token_ttl = (
+            named_token_ttl if named_token_ttl is not None else self.NAMED_TOKEN_TTL
+        )
+        if db_path is not None:
+            self._init_db(Path(db_path))
+
+    # --- persistence -----------------------------------------------------
+
+    def _init_db(self, path: Path) -> None:
+        """Open the SQLite store and load any still-valid named tokens."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), check_same_thread=False)
+            # Raw bearer tokens live in this file -- owner-only, like
+            # clients.json (sqlite3 creates it with the default umask).
+            os.chmod(path, 0o600)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS named_tokens ("
+                " token TEXT PRIMARY KEY,"
+                " client_id TEXT NOT NULL,"
+                " name TEXT NOT NULL,"
+                " expires_at REAL NOT NULL,"
+                " created_at REAL NOT NULL)"
+            )
+            conn.commit()
+            self._db = conn
+            now = time.time()
+            for row in conn.execute(
+                "SELECT token, client_id, name, expires_at, created_at "
+                "FROM named_tokens WHERE expires_at > ?",
+                (now,),
+            ).fetchall():
+                self._tokens[row[0]] = AccessToken(
+                    token=row[0], client_id=row[1], expires_at=row[3],
+                    name=row[2], created_at=row[4],
+                )
+            # Drop rows that expired while the process was down.
+            conn.execute("DELETE FROM named_tokens WHERE expires_at <= ?", (now,))
+            conn.commit()
+        except Exception:  # noqa: BLE001 -- persistence must never block startup
+            _logger.exception("named-token persistence disabled (db init failed)")
+            self._db = None
+
+    def _persist(self, at: AccessToken) -> None:
+        if self._db is None or at.name is None:
+            return
+        try:
+            with self._lock:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO named_tokens "
+                    "(token, client_id, name, expires_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (at.token, at.client_id, at.name, at.expires_at, at.created_at),
+                )
+                self._db.commit()
+        except Exception:  # noqa: BLE001
+            _logger.exception("failed to persist named token")
+
+    def _unpersist(self, token: str) -> None:
+        if self._db is None:
+            return
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM named_tokens WHERE token = ?", (token,))
+                self._db.commit()
+        except Exception:  # noqa: BLE001
+            _logger.exception("failed to delete persisted named token")
 
     def issue(
         self, client_id: str, *, name: str | None = None,
@@ -424,17 +528,25 @@ class TokenStore:
                     f"client {client_id} already has "
                     f"{self.NAMED_TOKEN_CAP} named tokens"
                 )
+        # Named tokens get the (longer, configurable) named lifetime; internal
+        # session bearers keep the short 24 h TTL. A named TTL of 0 means
+        # "never expires": the token lives until explicitly revoked.
+        ttl = self.named_token_ttl if name is not None else self.TOKEN_TTL
         token = secrets.token_hex(32)
         now = time.time()
-        self._tokens[token] = AccessToken(
+        expires_at = float("inf") if (name is not None and ttl == 0) else now + ttl
+        at = AccessToken(
             token=token,
             client_id=client_id,
-            expires_at=now + self.TOKEN_TTL,
+            expires_at=expires_at,
             name=name,
             created_at=now,
         )
+        self._tokens[token] = at
+        if name is not None:
+            self._persist(at)
         self._cleanup()
-        return token, self.TOKEN_TTL
+        return token, ttl
 
     def list_named(self, client_id: str) -> list[AccessToken]:
         """Return named tokens for ``client_id`` (newest first)."""
@@ -477,6 +589,8 @@ class TokenStore:
         if not access_token:
             return None
         if time.time() > access_token.expires_at:
+            if access_token.name is not None:
+                self._unpersist(token)
             del self._tokens[token]
             return None
         return access_token.client_id
@@ -501,12 +615,18 @@ class TokenStore:
         deadline = time.time() + self.REVOKE_GRACE_SECONDS
         if access_token.expires_at > deadline:
             access_token.expires_at = deadline
+        # Drop from durable storage immediately so a restart inside the grace
+        # window doesn't resurrect a token the user just revoked.
+        if access_token.name is not None:
+            self._unpersist(token)
         return True
 
     def _cleanup(self) -> None:
         now = time.time()
         expired = [t for t, at in self._tokens.items() if now > at.expires_at]
         for t in expired:
+            if self._tokens[t].name is not None:
+                self._unpersist(t)
             del self._tokens[t]
 
 

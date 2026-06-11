@@ -240,7 +240,7 @@
                     <div class="token-row-head">
                       <strong>{{ t.name }}</strong>
                     </div>
-                    <div class="token-row-meta">{{ t.prefix }}… · expires in {{ t.expires_in_hours }} h</div>
+                    <div class="token-row-meta">{{ t.prefix }}… · {{ t.expires_label }}</div>
                   </div>
                   <form method="POST" action="/app/tokens/revoke" class="token-revoke-form">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -769,7 +769,8 @@ headers = { "Authorization" = "Bearer &lt;token&gt;" }</code></pre>
           <p>
             Any client that can send <code>Authorization: Bearer …</code> on HTTP POST works. Mint
             a token, point the client at <code>{{ mcp_url }}</code>, and attach the bearer on
-            every request. Tokens live 24 h.
+            every request. Named tokens live {{ named_ttl_label }} and
+            survive restarts — revoke them here any time.
           </p>
         </article>
       </div>

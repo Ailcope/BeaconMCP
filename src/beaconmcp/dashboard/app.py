@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1154,6 +1155,8 @@ def _render_tokens_page(
     tokens_raw = deps.token_store.list_named(session.client_id)  # type: ignore[attr-defined]
     now = time.time()
     def _expires_label(expires_at: float) -> str:
+        if math.isinf(expires_at):
+            return "never expires (revoke-only)"
         secs = max(0, expires_at - now)
         if secs >= 48 * 3600:
             return f"expires in {round(secs / 86400)} days"
@@ -1165,18 +1168,26 @@ def _render_tokens_page(
             "prefix": t.token[:12],
             "created_at": t.created_at,
             "expires_at": t.expires_at,
-            "expires_in_hours": max(0, round((t.expires_at - now) / 3600, 1)),
+            "expires_in_hours": (
+                None if math.isinf(t.expires_at)
+                else max(0, round((t.expires_at - now) / 3600, 1))
+            ),
             "expires_label": _expires_label(t.expires_at),
         }
         for t in tokens_raw
     ]
     count = len(tokens)
     cap = getattr(deps.token_store, "NAMED_TOKEN_CAP", 3)
-    # Named-token lifetime for the page copy (days, rounded).
+    # Named-token lifetime for the page copy. A TTL of 0 means
+    # "never expires" -- the token lives until revoked.
     named_ttl_seconds = getattr(
         deps.token_store, "named_token_ttl", 24 * 3600,
     )
-    named_ttl_days = max(1, round(named_ttl_seconds / 86400))
+    if named_ttl_seconds == 0:
+        named_ttl_label = "until revoked (no expiry)"
+    else:
+        days = max(1, round(named_ttl_seconds / 86400))
+        named_ttl_label = f"{days} day{'s' if days != 1 else ''}"
 
     client_name = (
         deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
@@ -1203,7 +1214,7 @@ def _render_tokens_page(
         tokens=tokens,
         count=count,
         cap=cap,
-        named_ttl_days=named_ttl_days,
+        named_ttl_label=named_ttl_label,
         can_create=count < cap,
         form_error=form_error,
         form_name=form_name,

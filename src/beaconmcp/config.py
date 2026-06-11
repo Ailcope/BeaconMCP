@@ -528,10 +528,15 @@ class Config:
             ),
             named_token_ttl=(
                 int(srv_raw["named_token_ttl"])
-                if srv_raw.get("named_token_ttl")
+                if srv_raw.get("named_token_ttl") is not None
                 else None
             ),
         )
+        if server.named_token_ttl is not None and server.named_token_ttl < 0:
+            raise ConfigError(
+                "server.named_token_ttl: must be >= 0 seconds "
+                "(0 = named tokens never expire, revoke-only)."
+            )
 
         feat_raw = raw.get("features") or {}
         dash_raw = feat_raw.get("dashboard") or {}
@@ -673,9 +678,13 @@ class Config:
                 "audit_log": self.server.audit_log
                 or "(default: /opt/beaconmcp/audit.log)",
                 "named_token_ttl": (
-                    self.server.named_token_ttl
-                    if self.server.named_token_ttl
-                    else "(default: 30 days)"
+                    "(default: 30 days)"
+                    if self.server.named_token_ttl is None
+                    else (
+                        "0 (never expires, revoke-only)"
+                        if self.server.named_token_ttl == 0
+                        else self.server.named_token_ttl
+                    )
                 ),
             },
             "proxmox": {

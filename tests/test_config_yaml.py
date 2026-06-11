@@ -716,3 +716,26 @@ def test_server_tokens_db_and_audit_log_default_none(
     cfg = Config.load(config_path=path)
     assert cfg.server.tokens_db is None
     assert cfg.server.audit_log is None
+
+
+def test_server_named_token_ttl_zero_and_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VPS_PW", "pw")
+    base = """
+    version: 1
+    server:
+      named_token_ttl: {value}
+    ssh:
+      hosts:
+        - name: vps1
+          host: 198.51.100.10
+          user: root
+          password: ${{VPS_PW}}
+    """
+    # 0 is a deliberate setting (never expires) and must survive parsing.
+    cfg = Config.load(config_path=_write(tmp_path / "zero.yaml", base.format(value=0)))
+    assert cfg.server.named_token_ttl == 0
+    # Negatives are nonsense -- fail fast with the offending key.
+    with pytest.raises(ConfigError, match="named_token_ttl"):
+        Config.load(config_path=_write(tmp_path / "neg.yaml", base.format(value=-5)))

@@ -252,7 +252,7 @@ Common keys:
 | `features.dashboard.limits` | Per-5h and per-week USD caps for the Gemini chat. Set to `0` to disable a window. |
 | `server.tokens_db` | SQLite file persisting *named* API tokens (dashboard `/app/tokens` page) across restarts, created owner-only (0600). Default: `tokens.db` next to `clients_file`. Env override: `BEACONMCP_TOKENS_DB`. |
 | `server.audit_log` | JSON-lines audit log (tool calls, dashboard logins, OAuth authorize, client revokes), created owner-only (0600). Default: `/opt/beaconmcp/audit.log`; set to `-` to keep stderr only. Env override: `BEACONMCP_AUDIT_LOG`. |
-| `server.named_token_ttl` | Lifetime, in seconds, of *named* API tokens (dashboard `/app/tokens`). Default: `2592000` (30 days). Internal OAuth/session bearers keep the fixed 24 h TTL regardless. Env override: `BEACONMCP_NAMED_TOKEN_TTL`. |
+| `server.named_token_ttl` | Lifetime, in seconds, of *named* API tokens (dashboard `/app/tokens`). Default: `2592000` (30 days); `0` = never expires (revoke-only). Internal OAuth/session bearers keep the fixed 24 h TTL regardless. Env override: `BEACONMCP_NAMED_TOKEN_TTL`. |
 
 ---
 

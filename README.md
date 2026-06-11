@@ -252,6 +252,7 @@ Common keys:
 | `features.dashboard.limits` | Per-5h and per-week USD caps for the Gemini chat. Set to `0` to disable a window. |
 | `server.tokens_db` | SQLite file persisting *named* API tokens (dashboard `/app/tokens` page) across restarts, created owner-only (0600). Default: `tokens.db` next to `clients_file`. Env override: `BEACONMCP_TOKENS_DB`. |
 | `server.audit_log` | JSON-lines audit log (tool calls, dashboard logins, OAuth authorize, client revokes), created owner-only (0600). Default: `/opt/beaconmcp/audit.log`; set to `-` to keep stderr only. Env override: `BEACONMCP_AUDIT_LOG`. |
+| `server.named_token_ttl` | Lifetime, in seconds, of *named* API tokens (dashboard `/app/tokens`). Default: `2592000` (30 days). Internal OAuth/session bearers keep the fixed 24 h TTL regardless. Env override: `BEACONMCP_NAMED_TOKEN_TTL`. |
 
 ---
 
@@ -265,7 +266,7 @@ BeaconMCP exposes tools that cause irreversible changes: `ssh_run`, `proxmox_run
 - **Read the `command` argument** before approving any `ssh_run` or `proxmox_run` call. Ask: if this ran against the wrong VM or host, could I recover?
 - **The integrated chat** at `/app/chat` already forces human confirmation for every `ssh_run` / `proxmox_run` call that carries a `command` (polling-only calls with just `exec_id` are read-only and skip the modal). Read the arguments shown on the confirmation card even when you click through fast. No answer within 5 minutes counts as refusal.
 - **Prefer read-only tools** (`*_list_*`, `*_status`, `*_get_*`, `get_logs`, `health_status`) for exploration — they cannot break anything and are never gated by confirmation.
-- **Do not share a `/app/tokens` bearer** with a client you do not fully control. A leaked token grants arbitrary shell access on your Proxmox nodes for 24 hours.
+- **Do not share a `/app/tokens` bearer** with a client you do not fully control. A leaked token grants arbitrary shell access on your Proxmox nodes for the token's full lifetime (named tokens last `server.named_token_ttl`, 30 days by default), so revoke it from `/app/tokens` the moment it leaks.
 
 `systemctl restart beaconmcp` invalidates dashboard sessions and other internal bearers — but **named API tokens survive restarts** (they persist in `server.tokens_db`). To kill a named token, revoke it from `/app/tokens`; to kill all of them at once, delete the `tokens.db` file before restarting.
 

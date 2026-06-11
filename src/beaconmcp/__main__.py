@@ -431,7 +431,15 @@ def _run_http(mcp, host: str, port: int):
         if env_tokens_db
         else (config.server.tokens_db or clients_path.parent / "tokens.db")
     )
-    token_store = TokenStore(db_path=tokens_db)
+    # Named-token lifetime: BEACONMCP_NAMED_TOKEN_TTL env (seconds) >
+    # server.named_token_ttl in the YAML > TokenStore default (30 days).
+    env_named_ttl = os.environ.get("BEACONMCP_NAMED_TOKEN_TTL")
+    named_token_ttl = (
+        int(env_named_ttl)
+        if env_named_ttl and env_named_ttl.isdigit()
+        else config.server.named_token_ttl
+    )
+    token_store = TokenStore(db_path=tokens_db, named_token_ttl=named_token_ttl)
     code_store = CodeStore()
     # Share the TokenStore with MCP tools so security_end_session can revoke
     # the caller's bearer without an import cycle.

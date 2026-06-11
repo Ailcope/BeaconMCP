@@ -151,6 +151,11 @@ class ServerConfig:
     # set to ``-`` to disable the file and keep stderr only. The
     # BEACONMCP_AUDIT_LOG env var overrides this.
     audit_log: str | None = None
+    # Lifetime, in seconds, of *named* API tokens (dashboard ``/app/tokens``).
+    # ``None`` means the ``auth.TokenStore`` default (30 days). Internal
+    # session bearers always use the fixed 24 h TTL. The
+    # BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
+    named_token_ttl: int | None = None
 
 
 @dataclass
@@ -521,6 +526,11 @@ class Config:
             audit_log=(
                 str(srv_raw["audit_log"]) if srv_raw.get("audit_log") else None
             ),
+            named_token_ttl=(
+                int(srv_raw["named_token_ttl"])
+                if srv_raw.get("named_token_ttl")
+                else None
+            ),
         )
 
         feat_raw = raw.get("features") or {}
@@ -662,6 +672,11 @@ class Config:
                 ),
                 "audit_log": self.server.audit_log
                 or "(default: /opt/beaconmcp/audit.log)",
+                "named_token_ttl": (
+                    self.server.named_token_ttl
+                    if self.server.named_token_ttl
+                    else "(default: 30 days)"
+                ),
             },
             "proxmox": {
                 "verify_ssl": self.verify_ssl,

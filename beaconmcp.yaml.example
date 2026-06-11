@@ -80,6 +80,12 @@ server:
   # owner-only (0600). The BEACONMCP_AUDIT_LOG env var overrides this.
   # audit_log: /opt/beaconmcp/audit.log
 
+  # Lifetime (seconds) of *named* API tokens minted on the dashboard's
+  # "API tokens" page. They persist across restarts, so the default is
+  # 30 days (2592000) rather than the 24 h used for internal OAuth/session
+  # bearers. The BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
+  # named_token_ttl: 2592000
+
 # -------- Proxmox capability (optional) ------------------------------------
 # Delete this section if you have no Proxmox cluster. Tools starting with
 # `proxmox_` won't be registered.

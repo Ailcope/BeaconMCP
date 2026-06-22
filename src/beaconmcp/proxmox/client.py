@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -27,24 +28,33 @@ class ProxmoxClient:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._connections: dict[str, ProxmoxAPI] = {}
+        # Sync tools now run on a worker-thread pool (see server._metric_tool),
+        # so the connection cache is hit concurrently. The lock only guards the
+        # cheap, non-blocking dict access / connection construction -- it is
+        # never held across a network call.
+        self._lock = threading.Lock()
 
     def _get_connection(self, node_name: str) -> ProxmoxAPI:
-        if node_name in self._connections:
-            return self._connections[node_name]
+        with self._lock:
+            conn = self._connections.get(node_name)
+            if conn is not None:
+                return conn
 
-        pve_node = self._config.get_node(node_name)
-        if not pve_node:
-            raise NodeNotFoundError(node_name, [n.name for n in self._config.pve_nodes])
+            pve_node = self._config.get_node(node_name)
+            if not pve_node:
+                raise NodeNotFoundError(
+                    node_name, [n.name for n in self._config.pve_nodes]
+                )
 
-        conn = ProxmoxAPI(
-            pve_node.host,
-            user=pve_node.token_id.split("!")[0],
-            token_name=pve_node.token_id.split("!")[1],
-            token_value=pve_node.token_secret,
-            verify_ssl=self._config.verify_ssl,
-        )
-        self._connections[node_name] = conn
-        return conn
+            conn = ProxmoxAPI(
+                pve_node.host,
+                user=pve_node.token_id.split("!")[0],
+                token_name=pve_node.token_id.split("!")[1],
+                token_value=pve_node.token_secret,
+                verify_ssl=self._config.verify_ssl,
+            )
+            self._connections[node_name] = conn
+            return conn
 
     def api_call(self, node_name: str, method: str, path: str, **kwargs: Any) -> Any:
         """Execute an API call against a Proxmox node.
@@ -67,7 +77,8 @@ class ProxmoxClient:
                 last_exc = e
                 # Drop the cached connection so the retry rebuilds TLS state
                 # rather than re-using a half-broken socket.
-                self._connections.pop(node_name, None)
+                with self._lock:
+                    self._connections.pop(node_name, None)
                 if attempt + 1 < _RETRY_ATTEMPTS:
                     _logger.warning(
                         "transient error on %s %s (attempt %d/%d): %s",

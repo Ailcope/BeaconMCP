@@ -95,6 +95,45 @@ def _apply_legacy_env_shim() -> None:
 _apply_legacy_env_shim()
 
 
+_logger = logging.getLogger("beaconmcp")
+
+
+# Edge header set by Cloudflare on every request it proxies. Its presence on a
+# request that reached us *without* a usable Authorization header is the
+# fingerprint of a Cloudflare WAF / Access / Bot-management rule stripping or
+# blocking the header before it ever reached the app.
+_CF_EDGE_HEADER = "cf-ray"
+_CF_HINT = (
+    "Request arrived via Cloudflare (cf-ray present) without an Authorization "
+    "header -- a WAF/Access/Bot-Fight-Mode rule may be stripping or blocking it; "
+    "see docs/cloudflare.md"
+)
+
+
+def _build_unauthorized_body(headers, *, error: str) -> dict:
+    """Build the JSON body for a 401 on an MCP/OAuth-protected request.
+
+    For a plain direct request (curl, a misconfigured client) the body stays
+    minimal: ``{"error": "unauthorized"}``. When the request carries
+    Cloudflare's ``cf-ray`` edge header but no usable bearer, that strongly
+    signals an edge rule ate the ``Authorization`` header, so we enrich the
+    body with a ``hint`` pointing at the Cloudflare guide and emit a warning
+    (the operator sees this in ``journalctl -u beaconmcp``). The 401 status
+    and ``WWW-Authenticate`` header are set by the caller and never change --
+    OAuth discovery depends on them.
+    """
+    body: dict[str, str] = {"error": error}
+    if headers.get(_CF_EDGE_HEADER):
+        body["hint"] = _CF_HINT
+        _logger.warning(
+            "Unauthorized MCP request proxied by Cloudflare (cf-ray=%s) with no "
+            "valid Authorization header. A Cloudflare WAF/Access/Bot-Fight-Mode "
+            "rule is likely stripping or blocking it. See docs/cloudflare.md.",
+            headers.get(_CF_EDGE_HEADER),
+        )
+    return body
+
+
 def main():
     parser = argparse.ArgumentParser(description="BeaconMCP - Proxmox MCP Server")
     sub = parser.add_subparsers(dest="command")
@@ -390,7 +429,6 @@ def _run_http(mcp, host: str, port: int):
 
     class MetricsMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            start = time.monotonic()
             path = request.url.path
 
             # Group dashboard and static paths to avoid cardinality explosion
@@ -1034,7 +1072,7 @@ h1 {{ margin: 0 0 4px; font-size: 22px; font-weight: 600; letter-spacing: -0.015
         authorization = request.headers.get("authorization", "")
         if not authorization.startswith("Bearer "):
             return JSONResponse(
-                {"error": "unauthorized"},
+                _build_unauthorized_body(request.headers, error="unauthorized"),
                 status_code=401,
                 headers={
                     "WWW-Authenticate": f'Bearer realm="beaconmcp", resource_metadata="{resource_meta}"',
@@ -1045,7 +1083,7 @@ h1 {{ margin: 0 0 4px; font-size: 22px; font-weight: 600; letter-spacing: -0.015
         client_id = token_store.validate(bearer)
         if not client_id:
             return JSONResponse(
-                {"error": "invalid_token"},
+                _build_unauthorized_body(request.headers, error="invalid_token"),
                 status_code=401,
                 headers={
                     "WWW-Authenticate": f'Bearer realm="beaconmcp", error="invalid_token", resource_metadata="{resource_meta}"',

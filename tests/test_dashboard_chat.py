@@ -20,7 +20,6 @@ from beaconmcp.dashboard.chat import (
     FakeChatEngine,
     FakeScript,
     TextDelta,
-    ThinkingDelta,
     ToolCallEnd,
     ToolCallStart,
     ToolConfirmRequired,
@@ -569,7 +568,8 @@ def test_chat_stream_ssh_tool_emits_confirm_event(app_and_client, engine, deps):
     """ssh_run triggers a tool_confirm_required SSE frame and the
     engine must wait for a decision via /app/api/chat/confirm.
     """
-    import threading, time as _t
+    import threading
+    import time as _t
 
     engine.script = FakeScript(events=[
         ToolCallStart(id="tc1", name="ssh_run", args={"host": "pve1", "command": "ls"}),

@@ -14,12 +14,22 @@ The MCP endpoint returns **401 or 403 only via the public Cloudflare URL** while
 containing a `hint` that mentions `cf-ray`, BeaconMCP detected the request came
 through Cloudflare with no usable bearer — a Cloudflare rule ate it.
 
+A second, distinct symptom: a command **works until one of its arguments
+contains an attack-shaped string** — a path like `/etc/passwd`, a traversal
+`../../`, an `http://host/x.php?...` URL, or a SQL-ish quote — at which point you
+get Cloudflare's full-page **"Sorry, you have been blocked"** HTML (with a Ray
+ID), *not* a JSON 401/403. That is the OWASP Managed Ruleset, not auth: the
+request is dropped at the edge and never reaches BeaconMCP, so there is no
+server-side fix — only the WAF skip in §1. Verified against a live deployment:
+`ssh_run` with `curl http://evil.example.com/shell.php?x=../../../../etc/passwd`
+is blocked, while the same call with a plain URL or no URL is not.
+
 ## Why it happens
 
 | Cloudflare feature | What it does to MCP |
 |--------------------|---------------------|
 | Bot Fight Mode / Super Bot Fight Mode / Browser Integrity Check | Challenges or blocks non-browser clients (MCP sends no browser headers) → **403 / challenge HTML** before the app sees the request. |
-| WAF Managed Rules | False-positive on JSON-RPC POST bodies → **403**. |
+| WAF Managed Rules (OWASP CRS) | False-positive on a tool **argument** that pattern-matches an attack signature — path traversal (`../../`), `/etc/passwd`, an RFI/LFI URL (`http://host/x.php?...`), SQL-ish quotes. These appear constantly in legitimate infra commands (`cat /etc/passwd`, `grep -r ../`, `curl http://repo/file.tar.gz`), so Cloudflare serves its **"Sorry, you have been blocked"** HTML → **403** and BeaconMCP never sees the request. |
 | Cloudflare Access | Sits in front of the hostname and **consumes/strips the `Authorization` header** (it owns that header for its own JWT) → BeaconMCP sees no bearer → **401**. |
 | "Cache Everything" / buffering | Buffers or caches the streamable-HTTP / SSE response → the MCP stream hangs or returns stale data. |
 

@@ -213,6 +213,46 @@ class AccessToken:
     # not listed in the external-tokens UI.
     name: str | None = None
     created_at: float = 0.0
+    # Refresh-token family the token was minted in (OAuth
+    # ``authorization_code`` grant only). Lets reuse detection and
+    # end-of-session revoke every bearer of the family at once.
+    family_id: str | None = None
+
+
+@dataclass
+class RefreshToken:
+    # SHA-256 of the raw token: only the client ever holds the raw value.
+    token_hash: str
+    client_id: str
+    family_id: str
+    expires_at: float
+    created_at: float
+    # Rotated out. Kept until it expires so a replay can be recognised as
+    # reuse (and the family revoked) instead of a plain unknown token.
+    used: bool = False
+
+
+@dataclass
+class OAuthGrant:
+    """Result of an OAuth token issuance or refresh."""
+
+    access_token: str
+    expires_in: int
+    refresh_token: str | None = None
+
+
+class RefreshTokenError(Exception):
+    """A refresh token was rejected.
+
+    ``reason`` is one of ``invalid`` (unknown, rotated-out-and-purged or
+    owned by another client), ``expired`` or ``reused`` (an already-rotated
+    token was replayed: its whole family has been revoked).
+    """
+
+    def __init__(self, reason: str, *, family_id: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.family_id = family_id
 
 
 @dataclass
@@ -515,13 +555,17 @@ class TokenCapExceeded(Exception):
 
 
 class TokenStore:
-    """Access token store with expiration and optional named-token persistence.
+    """Access token store with expiration and optional persistence.
 
-    Internal (unnamed) bearers live only in memory -- a re-login or restart
-    is expected to drop them. *Named* tokens (the ones a human mints on the
-    dashboard "API tokens" page and pastes into an external client) are
-    persisted to a small SQLite file when ``db_path`` is given, so a
-    ``systemctl restart`` / redeploy no longer silently invalidates them.
+    Dashboard-session bearers (``issue`` without a name) live only in
+    memory -- a re-login or restart is expected to drop them. Everything a
+    remote client holds is persisted to a small SQLite file when
+    ``db_path`` is given, so a ``systemctl restart`` / redeploy no longer
+    silently invalidates it:
+
+    * *named* tokens (dashboard "API tokens" page), stored as-is;
+    * OAuth access tokens and refresh tokens (``issue_oauth`` / ``refresh``),
+      stored as SHA-256 hashes and kept in memory keyed by that hash.
     """
 
     TOKEN_TTL = 3600 * 24  # 24 hours -- internal/session bearers
@@ -530,6 +574,11 @@ class TokenStore:
     # into an external client -- 30 days is the sensible default. Overridable
     # per-deployment via ``named_token_ttl`` (server.named_token_ttl / env).
     NAMED_TOKEN_TTL = 3600 * 24 * 30  # 30 days
+    # Default lifetime of an OAuth refresh token. Every refresh rotates it
+    # and restarts the clock, so a client in regular use never has to
+    # re-authenticate. Overridable via ``refresh_token_ttl``
+    # (server.refresh_token_ttl / env); ``0`` means never expires.
+    REFRESH_TOKEN_TTL = 3600 * 24 * 30  # 30 days
     # Cap on named tokens (the ones listed in the dashboard's API
     # tokens page). Internal dashboard-session bearers are unlimited
     # because a re-login always revokes the prior one.
@@ -540,8 +589,12 @@ class TokenStore:
         db_path: Path | str | None = None,
         *,
         named_token_ttl: int | None = None,
+        refresh_token_ttl: int | None = None,
     ) -> None:
         self._tokens: dict[str, AccessToken] = {}
+        # OAuth bearers and refresh tokens, keyed by SHA-256 of the raw token.
+        self._oauth_tokens: dict[str, AccessToken] = {}
+        self._refresh_tokens: dict[str, RefreshToken] = {}
         self._db: sqlite3.Connection | None = None
         # Re-entrant: tools now run on worker threads (see server._metric_tool),
         # so the in-memory dict is touched concurrently. Several methods hold
@@ -554,6 +607,11 @@ class TokenStore:
         # so only ``None`` falls back to the 30-day default.
         self.named_token_ttl = (
             named_token_ttl if named_token_ttl is not None else self.NAMED_TOKEN_TTL
+        )
+        self.refresh_token_ttl = (
+            refresh_token_ttl
+            if refresh_token_ttl is not None
+            else self.REFRESH_TOKEN_TTL
         )
         if db_path is not None:
             self._init_db(Path(db_path))
@@ -576,6 +634,25 @@ class TokenStore:
                 " expires_at REAL NOT NULL,"
                 " created_at REAL NOT NULL)"
             )
+            # OAuth material is stored hashed: a leaked tokens.db must not
+            # hand out working bearers or refresh tokens.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS oauth_tokens ("
+                " token_hash TEXT PRIMARY KEY,"
+                " client_id TEXT NOT NULL,"
+                " family_id TEXT,"
+                " expires_at REAL NOT NULL,"
+                " created_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS refresh_tokens ("
+                " token_hash TEXT PRIMARY KEY,"
+                " client_id TEXT NOT NULL,"
+                " family_id TEXT NOT NULL,"
+                " expires_at REAL NOT NULL,"
+                " created_at REAL NOT NULL,"
+                " used INTEGER NOT NULL DEFAULT 0)"
+            )
             conn.commit()
             self._db = conn
             now = time.time()
@@ -588,11 +665,31 @@ class TokenStore:
                     token=row[0], client_id=row[1], expires_at=row[3],
                     name=row[2], created_at=row[4],
                 )
+            for row in conn.execute(
+                "SELECT token_hash, client_id, family_id, expires_at, created_at "
+                "FROM oauth_tokens WHERE expires_at > ?",
+                (now,),
+            ).fetchall():
+                self._oauth_tokens[row[0]] = AccessToken(
+                    token=row[0], client_id=row[1], expires_at=row[3],
+                    created_at=row[4], family_id=row[2],
+                )
+            for row in conn.execute(
+                "SELECT token_hash, client_id, family_id, expires_at, created_at, used "
+                "FROM refresh_tokens WHERE expires_at > ?",
+                (now,),
+            ).fetchall():
+                self._refresh_tokens[row[0]] = RefreshToken(
+                    token_hash=row[0], client_id=row[1], family_id=row[2],
+                    expires_at=row[3], created_at=row[4], used=bool(row[5]),
+                )
             # Drop rows that expired while the process was down.
             conn.execute("DELETE FROM named_tokens WHERE expires_at <= ?", (now,))
+            conn.execute("DELETE FROM oauth_tokens WHERE expires_at <= ?", (now,))
+            conn.execute("DELETE FROM refresh_tokens WHERE expires_at <= ?", (now,))
             conn.commit()
         except Exception:  # noqa: BLE001 -- persistence must never block startup
-            _logger.exception("named-token persistence disabled (db init failed)")
+            _logger.exception("token persistence disabled (db init failed)")
             self._db = None
 
     def _persist(self, at: AccessToken) -> None:
@@ -619,6 +716,34 @@ class TokenStore:
                 self._db.commit()
         except Exception:  # noqa: BLE001
             _logger.exception("failed to delete persisted named token")
+
+    def _db_write(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        """Run one write statement against the store; never raises."""
+        if self._db is None:
+            return
+        try:
+            with self._lock:
+                self._db.execute(sql, params)
+                self._db.commit()
+        except Exception:  # noqa: BLE001
+            _logger.exception("token store write failed")
+
+    def _persist_oauth(self, at: AccessToken) -> None:
+        self._db_write(
+            "INSERT OR REPLACE INTO oauth_tokens "
+            "(token_hash, client_id, family_id, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (at.token, at.client_id, at.family_id, at.expires_at, at.created_at),
+        )
+
+    def _persist_refresh(self, rt: RefreshToken) -> None:
+        self._db_write(
+            "INSERT OR REPLACE INTO refresh_tokens "
+            "(token_hash, client_id, family_id, expires_at, created_at, used) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rt.token_hash, rt.client_id, rt.family_id, rt.expires_at,
+             rt.created_at, int(rt.used)),
+        )
 
     def issue(
         self, client_id: str, *, name: str | None = None,
@@ -655,6 +780,136 @@ class TokenStore:
                 self._persist(at)
             self._cleanup()
             return token, ttl
+
+    # --- OAuth grants --------------------------------------------------------
+
+    def _mint_oauth(
+        self, client_id: str, family_id: str | None,
+    ) -> OAuthGrant:
+        """Mint a persisted OAuth bearer, plus a refresh token when
+        ``family_id`` is given. Caller holds the lock."""
+        now = time.time()
+        access = secrets.token_hex(32)
+        at = AccessToken(
+            token=_hash_secret(access),
+            client_id=client_id,
+            expires_at=now + self.TOKEN_TTL,
+            created_at=now,
+            family_id=family_id,
+        )
+        self._oauth_tokens[at.token] = at
+        self._persist_oauth(at)
+        refresh: str | None = None
+        if family_id is not None:
+            refresh = secrets.token_hex(32)
+            ttl = self.refresh_token_ttl
+            rt = RefreshToken(
+                token_hash=_hash_secret(refresh),
+                client_id=client_id,
+                family_id=family_id,
+                expires_at=float("inf") if ttl == 0 else now + ttl,
+                created_at=now,
+            )
+            self._refresh_tokens[rt.token_hash] = rt
+            self._persist_refresh(rt)
+        return OAuthGrant(
+            access_token=access, expires_in=self.TOKEN_TTL, refresh_token=refresh,
+        )
+
+    def issue_oauth(self, client_id: str, *, refresh: bool = False) -> OAuthGrant:
+        """Issue a persisted OAuth access token for ``client_id``.
+
+        With ``refresh=True`` (``authorization_code`` grant) a refresh token
+        opening a new rotation family is issued alongside it.
+        """
+        with self._lock:
+            family_id = secrets.token_hex(16) if refresh else None
+            grant = self._mint_oauth(client_id, family_id)
+            self._cleanup()
+            return grant
+
+    def refresh(self, refresh_token: str, client_id: str) -> OAuthGrant:
+        """Exchange a refresh token for a new access + refresh token pair.
+
+        The presented token is rotated out. Replaying a rotated-out token
+        revokes its whole family (OAuth 2.1 / RFC 9700 reuse detection):
+        either the legitimate client or an attacker holds a stolen copy,
+        and there is no telling which. Raises :class:`RefreshTokenError`.
+        """
+        with self._lock:
+            rt = self._refresh_tokens.get(_hash_secret(refresh_token))
+            if rt is None or rt.client_id != client_id:
+                raise RefreshTokenError("invalid")
+            if time.time() > rt.expires_at:
+                self._drop_refresh(rt.token_hash)
+                raise RefreshTokenError("expired", family_id=rt.family_id)
+            if rt.used:
+                self.revoke_family(rt.family_id)
+                raise RefreshTokenError("reused", family_id=rt.family_id)
+            rt.used = True
+            self._persist_refresh(rt)
+            grant = self._mint_oauth(client_id, rt.family_id)
+            self._cleanup()
+            return grant
+
+    def family_of(self, refresh_token: str) -> str | None:
+        """Family id of a refresh token, for audit attribution."""
+        with self._lock:
+            rt = self._refresh_tokens.get(_hash_secret(refresh_token))
+            return rt.family_id if rt is not None else None
+
+    def _drop_refresh(self, token_hash: str) -> None:
+        self._refresh_tokens.pop(token_hash, None)
+        self._db_write("DELETE FROM refresh_tokens WHERE token_hash = ?", (token_hash,))
+
+    def _drop_oauth(self, token_hash: str) -> None:
+        self._oauth_tokens.pop(token_hash, None)
+        self._db_write("DELETE FROM oauth_tokens WHERE token_hash = ?", (token_hash,))
+
+    def revoke_family(self, family_id: str) -> None:
+        """Immediately drop every access and refresh token of a family."""
+        with self._lock:
+            for h in [h for h, rt in self._refresh_tokens.items()
+                      if rt.family_id == family_id]:
+                del self._refresh_tokens[h]
+            for h in [h for h, at in self._oauth_tokens.items()
+                      if at.family_id == family_id]:
+                del self._oauth_tokens[h]
+            self._db_write("DELETE FROM refresh_tokens WHERE family_id = ?", (family_id,))
+            self._db_write("DELETE FROM oauth_tokens WHERE family_id = ?", (family_id,))
+
+    def revoke_client(self, client_id: str) -> int:
+        """Drop every OAuth access and refresh token held by ``client_id``.
+
+        Called when the client itself is deleted. Returns the number of
+        access tokens dropped.
+        """
+        with self._lock:
+            hashes = [h for h, at in self._oauth_tokens.items()
+                      if at.client_id == client_id]
+            for h in hashes:
+                del self._oauth_tokens[h]
+            for h in [h for h, rt in self._refresh_tokens.items()
+                      if rt.client_id == client_id]:
+                del self._refresh_tokens[h]
+            self._db_write("DELETE FROM oauth_tokens WHERE client_id = ?", (client_id,))
+            self._db_write("DELETE FROM refresh_tokens WHERE client_id = ?", (client_id,))
+            return len(hashes)
+
+    def prune_unknown_clients(self, known_client_ids: set[str]) -> int:
+        """Drop OAuth tokens of clients that no longer exist.
+
+        Covers clients deleted while the server was down or from another
+        process (``beaconmcp auth revoke``). Returns the number of clients
+        pruned.
+        """
+        with self._lock:
+            owners = {at.client_id for at in self._oauth_tokens.values()}
+            owners |= {rt.client_id for rt in self._refresh_tokens.values()}
+            stale = owners - known_client_ids
+            for cid in stale:
+                self.revoke_client(cid)
+            return len(stale)
 
     def list_named(self, client_id: str) -> list[AccessToken]:
         """Return named tokens for ``client_id`` (newest first)."""
@@ -699,13 +954,24 @@ class TokenStore:
         with self._lock:
             access_token = self._tokens.get(token)
             if not access_token:
-                return None
+                return self._validate_oauth(token)
             if time.time() > access_token.expires_at:
                 if access_token.name is not None:
                     self._unpersist(token)
                 del self._tokens[token]
                 return None
             return access_token.client_id
+
+    def _validate_oauth(self, token: str) -> str | None:
+        with self._lock:
+            token_hash = _hash_secret(token)
+            at = self._oauth_tokens.get(token_hash)
+            if at is None:
+                return None
+            if time.time() > at.expires_at:
+                self._drop_oauth(token_hash)
+                return None
+            return at.client_id
 
     # Seconds to keep a revoked token alive so the current MCP response /
     # SSE stream has time to reach the client before the middleware starts
@@ -724,7 +990,7 @@ class TokenStore:
         with self._lock:
             access_token = self._tokens.get(token)
             if access_token is None:
-                return False
+                return self._revoke_oauth(token)
             deadline = time.time() + self.REVOKE_GRACE_SECONDS
             if access_token.expires_at > deadline:
                 access_token.expires_at = deadline
@@ -732,6 +998,31 @@ class TokenStore:
             # window doesn't resurrect a token the user just revoked.
             if access_token.name is not None:
                 self._unpersist(token)
+            return True
+
+    def _revoke_oauth(self, token: str) -> bool:
+        """OAuth flavour of :meth:`revoke`: same grace window for the bearer,
+        and its refresh family dies right away so the client can't quietly
+        mint a replacement (this is what ``security_end_session`` hits)."""
+        with self._lock:
+            token_hash = _hash_secret(token)
+            at = self._oauth_tokens.get(token_hash)
+            if at is None:
+                return False
+            deadline = time.time() + self.REVOKE_GRACE_SECONDS
+            if at.expires_at > deadline:
+                at.expires_at = deadline
+            # Unpersisted now, like named tokens: a restart inside the grace
+            # window must not resurrect it.
+            self._db_write("DELETE FROM oauth_tokens WHERE token_hash = ?", (token_hash,))
+            if at.family_id is not None:
+                family_id = at.family_id
+                for h in [h for h, rt in self._refresh_tokens.items()
+                          if rt.family_id == family_id]:
+                    del self._refresh_tokens[h]
+                self._db_write(
+                    "DELETE FROM refresh_tokens WHERE family_id = ?", (family_id,),
+                )
             return True
 
     def _cleanup(self) -> None:
@@ -742,6 +1033,12 @@ class TokenStore:
                 if self._tokens[t].name is not None:
                     self._unpersist(t)
                 del self._tokens[t]
+            for h in [h for h, at in self._oauth_tokens.items()
+                      if now > at.expires_at]:
+                self._drop_oauth(h)
+            for h in [h for h, rt in self._refresh_tokens.items()
+                      if now > rt.expires_at]:
+                self._drop_refresh(h)
 
 
 class CodeStore:

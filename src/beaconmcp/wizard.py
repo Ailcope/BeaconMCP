@@ -152,6 +152,8 @@ class ServerDraft:
     audit_log: str = ""
     # Named-token lifetime in seconds; empty means the 30-day default.
     named_token_ttl: str = ""
+    # OAuth refresh-token lifetime in seconds; empty means the 30-day default.
+    refresh_token_ttl: str = ""
 
 
 @dataclass
@@ -259,6 +261,8 @@ def render_yaml(draft: ConfigDraft) -> str:
         lines.append(f"  audit_log: {_q(draft.server.audit_log)}")
     if draft.server.named_token_ttl:
         lines.append(f"  named_token_ttl: {draft.server.named_token_ttl}")
+    if draft.server.refresh_token_ttl:
+        lines.append(f"  refresh_token_ttl: {draft.server.refresh_token_ttl}")
     lines.append("")
 
     # Proxmox
@@ -457,6 +461,11 @@ def load_yaml_into_draft(path: Path) -> ConfigDraft:
         draft.server.named_token_ttl = (
             str(server.get("named_token_ttl"))
             if server.get("named_token_ttl") is not None
+            else ""
+        )
+        draft.server.refresh_token_ttl = (
+            str(server.get("refresh_token_ttl"))
+            if server.get("refresh_token_ttl") is not None
             else ""
         )
 
@@ -1240,6 +1249,17 @@ class _ServerPanel(Static):
             id="srv-named-ttl",
             placeholder="2592000",
         )
+        yield Static(
+            "refresh_token_ttl -- lifetime (seconds) of OAuth refresh tokens "
+            "(claude.ai and other authorization_code clients). Empty = 30 "
+            "days; 0 = never expires. Each refresh restarts the clock.",
+            classes="field-label",
+        )
+        yield Input(
+            value=srv.refresh_token_ttl,
+            id="srv-refresh-ttl",
+            placeholder="2592000",
+        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         srv = self.draft.server
@@ -1258,6 +1278,9 @@ class _ServerPanel(Static):
         elif event.input.id == "srv-named-ttl":
             raw = event.value.strip()
             srv.named_token_ttl = raw if raw.isdigit() else ""
+        elif event.input.id == "srv-refresh-ttl":
+            raw = event.value.strip()
+            srv.refresh_token_ttl = raw if raw.isdigit() else ""
         self.on_change()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:

@@ -47,6 +47,14 @@ and revoke it from `/app/tokens` the moment it leaks.
 API tokens survive restarts** — they live in `server.tokens_db`. Revoke them individually from
 `/app/tokens`, or delete `tokens.db` before restarting to kill all of them at once.
 
+OAuth access tokens and refresh tokens also survive restarts. They are stored in the same
+`tokens.db`, hashed with SHA-256, so the file alone does not hand out working credentials. Refresh
+tokens are only issued on the `authorization_code` grant (never on `client_credentials`, which keeps
+its TOTP-on-every-exchange rule). Each refresh rotates the token; replaying an already-used refresh
+token revokes every access and refresh token of that sign-in (`auth.token.refresh.reuse` in the
+audit log), and the client has to go through the authorization page again. Deleting a client, or
+calling `security_end_session`, drops its refresh tokens too.
+
 `security_end_session` lets a client revoke its own bearer at the end of a task, which is a cheap way
 to shrink the replay window.
 

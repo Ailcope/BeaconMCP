@@ -156,6 +156,12 @@ class ServerConfig:
     # session bearers always use the fixed 24 h TTL. The
     # BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
     named_token_ttl: int | None = None
+    # Lifetime, in seconds, of OAuth refresh tokens (``authorization_code``
+    # clients such as claude.ai). Each refresh rotates the token and restarts
+    # the clock. ``None`` means the ``auth.TokenStore`` default (30 days);
+    # ``0`` means never expires. The BEACONMCP_REFRESH_TOKEN_TTL env var
+    # overrides this.
+    refresh_token_ttl: int | None = None
 
 
 @dataclass
@@ -556,11 +562,21 @@ class Config:
                 if srv_raw.get("named_token_ttl") is not None
                 else None
             ),
+            refresh_token_ttl=(
+                int(srv_raw["refresh_token_ttl"])
+                if srv_raw.get("refresh_token_ttl") is not None
+                else None
+            ),
         )
         if server.named_token_ttl is not None and server.named_token_ttl < 0:
             raise ConfigError(
                 "server.named_token_ttl: must be >= 0 seconds "
                 "(0 = named tokens never expire, revoke-only)."
+            )
+        if server.refresh_token_ttl is not None and server.refresh_token_ttl < 0:
+            raise ConfigError(
+                "server.refresh_token_ttl: must be >= 0 seconds "
+                "(0 = refresh tokens never expire)."
             )
 
         feat_raw = raw.get("features") or {}
@@ -715,6 +731,15 @@ class Config:
                         "0 (never expires, revoke-only)"
                         if self.server.named_token_ttl == 0
                         else self.server.named_token_ttl
+                    )
+                ),
+                "refresh_token_ttl": (
+                    "(default: 30 days)"
+                    if self.server.refresh_token_ttl is None
+                    else (
+                        "0 (never expires)"
+                        if self.server.refresh_token_ttl == 0
+                        else self.server.refresh_token_ttl
                     )
                 ),
             },

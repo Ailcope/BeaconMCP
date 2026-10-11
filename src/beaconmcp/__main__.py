@@ -1212,6 +1212,10 @@ def _run_http(mcp, host: str, port: int, *, serve: bool = True):
     )
     from .ratelimit import RateLimiter, TotpLockout, client_ip, forwarded_host
     from .server import config, transport_security
+    # The same list the SDK enforces for CORS, including its built-in default
+    # when beaconmcp.yaml leaves server.allowed_origins empty: OAuth
+    # redirects to claude.ai must keep working out of the box.
+    redirect_origins = list(transport_security.allowed_origins or [])
 
     from .metrics import REGISTRY, auth_events, http_requests
 
@@ -1424,7 +1428,7 @@ def _run_http(mcp, host: str, port: int, *, serve: bool = True):
         # allowlist. Prevents authorization-code exfiltration via a
         # typo-squat or attacker-controlled client that somehow got a
         # valid client_id.
-        if not auth.is_trusted_redirect_uri(redirect_uri, config.server.allowed_origins):
+        if not auth.is_trusted_redirect_uri(redirect_uri, redirect_origins):
             return {}, JSONResponse(
                 {"error": "invalid_request",
                  "error_description": (
@@ -2280,7 +2284,7 @@ def _run_http(mcp, host: str, port: int, *, serve: bool = True):
                 status_code=400,
             )
         bad = [u for u in redirect_uris_raw
-               if not auth.is_trusted_redirect_uri(u, config.server.allowed_origins)]
+               if not auth.is_trusted_redirect_uri(u, redirect_origins)]
         if bad:
             return JSONResponse(
                 {"error": "invalid_redirect_uri",

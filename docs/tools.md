@@ -123,7 +123,7 @@ The token in the URL is the credential, so the route needs no bearer. A link is 
 node, VMID and path chosen when it was minted, works once, expires after `expires_in` seconds
 (default 600, at most 3600) and is forgotten on restart. The base of the URL is
 `features.dashboard.public_url` when set, otherwise the address the MCP request came in on.
-Behind Cloudflare, uploads are limited to 100 MB per request on the free plan.
+Behind Cloudflare, uploads are limited to 100 MB per request on the free plan. The link needs a running guest: minting one for a stopped VM/CT is refused, and an upload to a guest stopped since then answers 409.
 
 ## SSH (2)
 

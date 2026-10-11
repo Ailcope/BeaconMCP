@@ -27,6 +27,7 @@ from beaconmcp.proxmox import system  # noqa: E402
 
 NODE = "pve1"
 CT = 201
+STOPPED_CT = 202
 
 
 class FakeMCP:
@@ -41,7 +42,7 @@ class FakeMCP:
 
 
 class FakeProxmox:
-    """Knows a single LXC container, ``CT``."""
+    """Knows a running LXC container, ``CT``, and a stopped one, ``STOPPED_CT``."""
 
     def __init__(self, tmp_path: Path, max_mb: int = 1, public_url: str | None = "https://beacon.example") -> None:
         self._config = SimpleNamespace(
@@ -49,9 +50,12 @@ class FakeProxmox:
             features=SimpleNamespace(dashboard=SimpleNamespace(public_url=public_url)),
         )
 
+        self.stopped = {STOPPED_CT}
+
     def get(self, node: str, path: str, **_: Any) -> dict[str, Any]:
-        if path == f"nodes/{node}/lxc/{CT}/status/current":
-            return {"status": "running"}
+        for vmid in (CT, STOPPED_CT):
+            if path == f"nodes/{node}/lxc/{vmid}/status/current":
+                return {"status": "stopped" if vmid in self.stopped else "running"}
         return {"error": "not found"}
 
 
@@ -92,7 +96,9 @@ def env(tmp_path: Path):
         ),
     ])
     http = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://beacon.example")
-    yield SimpleNamespace(tools=mcp.tools, ssh=ssh, http=http, staging=tmp_path / "staging")
+    yield SimpleNamespace(
+        tools=mcp.tools, ssh=ssh, http=http, staging=tmp_path / "staging", proxmox=proxmox,
+    )
     transfers.register_pusher(None)
 
 
@@ -202,6 +208,35 @@ async def test_multipart_upload_is_refused(env) -> None:
     assert resp.status_code == 415
 
 
+async def test_mint_refuses_a_stopped_guest(env) -> None:
+    res = await _mint(env, vmid=STOPPED_CT)
+    assert res["status"] == "error"
+    assert "stopped" in res["error"]
+
+
+async def test_guest_stopped_after_mint_is_409(env) -> None:
+    link = await _mint(env)
+    env.proxmox.stopped.add(CT)
+    resp = await env.http.put(link["url"], content=b"data")
+    assert resp.status_code == 409
+    assert "stopped" in resp.json()["error"]
+    assert env.ssh.guest_files == {} and env.ssh.node_files == {}
+    assert list(env.staging.iterdir()) == []
+
+
+async def test_failed_push_is_500_not_502(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A 502 from the origin is replaced by Cloudflare's own error page,
+    # which would hide the reason from the uploader.
+    async def failing_exec(host: str, command: str, timeout: int = 60) -> dict[str, Any]:
+        return {"exit_code": 1, "stdout": "", "stderr": "no such directory"}
+
+    monkeypatch.setattr(env.ssh, "exec_command", failing_exec)
+    link = await _mint(env)
+    resp = await env.http.put(link["url"], content=b"data")
+    assert resp.status_code == 500
+    assert "no such directory" in resp.json()["error"]
+
+
 async def test_unknown_token_is_404(env) -> None:
     resp = await env.http.put(transfers.UPLOAD_PATH_PREFIX + "nope", content=b"x")
     assert resp.status_code == 404
@@ -295,6 +330,15 @@ async def test_fetch_url_refuses_local_targets(env, remote, url: str) -> None:
 async def test_fetch_url_allows_private_lan(env, remote) -> None:
     res = await env.tools["proxmox_fetch_url"](node=NODE, vmid=CT, url="http://lan.example/f", dest="/x")
     assert res["status"] == "success", res
+
+
+async def test_fetch_url_refuses_a_stopped_guest_before_downloading(env, remote) -> None:
+    res = await env.tools["proxmox_fetch_url"](
+        node=NODE, vmid=STOPPED_CT, url="https://files.example/tool.bin", dest="/x",
+    )
+    assert res["status"] == "error"
+    assert "stopped" in res["error"]
+    assert remote.requested == []
 
 
 async def test_fetch_url_checks_target_before_downloading(env, remote) -> None:

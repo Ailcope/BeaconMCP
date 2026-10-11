@@ -272,4 +272,17 @@ async def _receive_and_push(request: Request, link: UploadLink) -> tuple[dict[st
 
     result.setdefault("bytes", received)
     result["link_id"] = link.link_id
-    return result, 200 if result.get("status") == "success" else 502
+    return result, _status_code(result)
+
+
+def _status_code(result: dict[str, Any]) -> int:
+    """HTTP status for a finished transfer.
+
+    Not 502: Cloudflare swaps an origin 502 for its own "error code: 502"
+    page, so the uploader would never see why the push failed.
+    """
+    if result.get("status") == "success":
+        return 200
+    if "guest_status" in result:
+        return 409  # target stopped since the link was minted
+    return 500

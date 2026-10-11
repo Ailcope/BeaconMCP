@@ -50,14 +50,43 @@ def _prune_exec_sessions() -> None:
         del _exec_sessions[eid]
 
 
-def _detect_vm_type(client: ProxmoxClient, node: str, vmid: int) -> str | None:
+def _detect_guest(client: ProxmoxClient, node: str, vmid: int) -> tuple[str, str] | None:
+    """``(vm_type, status)`` of a guest, e.g. ``("lxc", "running")``."""
     for vm_type in ("qemu", "lxc"):
         data = client.get(node, f"nodes/{node}/{vm_type}/{vmid}/status/current")
         if isinstance(data, dict) and "error" in data:
             continue
         if isinstance(data, dict) and data.get("status"):
-            return vm_type
+            return vm_type, str(data["status"])
     return None
+
+
+def _detect_vm_type(client: ProxmoxClient, node: str, vmid: int) -> str | None:
+    guest = _detect_guest(client, node, vmid)
+    return guest[0] if guest else None
+
+
+async def _running_guest(
+    client: ProxmoxClient, node: str, vmid: int,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve a push target: ``(vm_type, None)`` or ``(None, error result)``.
+
+    Files can only be pushed into a running guest (``pct push`` refuses a
+    stopped CT, a stopped VM has no SSH), so check it up front rather than
+    after the bytes were transferred.
+    """
+    loop = asyncio.get_running_loop()
+    guest = await loop.run_in_executor(None, _detect_guest, client, node, vmid)
+    if guest is None:
+        return None, {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+    vm_type, status = guest
+    if status != "running":
+        return None, {
+            "status": "error",
+            "error": f"VM/CT {vmid} is {status}: start it first, files can only be pushed into a running guest.",
+            "guest_status": status,
+        }
+    return vm_type, None
 
 
 #: Added to an agent/exec error when the guest OS could not be detected, so a
@@ -233,9 +262,9 @@ async def _push_staged(
     size_bytes = local_path.stat().st_size
 
     loop = asyncio.get_running_loop()
-    vm_type = await loop.run_in_executor(None, _detect_vm_type, client, node, vmid)
-    if not vm_type:
-        return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+    vm_type, err = await _running_guest(client, node, vmid)
+    if err is not None:
+        return err
 
     started = time.monotonic()
     local_sha = await loop.run_in_executor(None, _sha256_file, local_path) if verify_checksum else None
@@ -791,10 +820,9 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
             return {"status": "error", "error": "`node` and `vmid` are required to mint a link."}
         if not isinstance(dest, str) or not dest.startswith("/"):
             return {"status": "error", "error": "`dest` must be an absolute path inside the guest."}
-        loop = asyncio.get_running_loop()
-        vm_type = await loop.run_in_executor(None, _detect_vm_type, client, node, vmid)
-        if not vm_type:
-            return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+        vm_type, err = await _running_guest(client, node, vmid)
+        if err is not None:
+            return err
 
         max_bytes = client._config.server.transfers_max_mb * 1024 * 1024
         try:
@@ -860,9 +888,9 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
         if not isinstance(dest, str) or not dest.startswith("/"):
             return {"status": "error", "error": "`dest` must be an absolute path inside the guest."}
         # Check the target before pulling a possibly large file for nothing.
-        loop = asyncio.get_running_loop()
-        if not await loop.run_in_executor(None, _detect_vm_type, client, node, vmid):
-            return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+        _vm_type, err = await _running_guest(client, node, vmid)
+        if err is not None:
+            return err
 
         max_bytes = client._config.server.transfers_max_mb * 1024 * 1024
         staged = _staging_dir(client) / f"fetch-{uuid.uuid4().hex[:12]}"

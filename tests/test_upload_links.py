@@ -277,7 +277,7 @@ def remote(monkeypatch: pytest.MonkeyPatch):
     real = httpx.AsyncClient
     monkeypatch.setattr(
         system.httpx, "AsyncClient",
-        lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
+        lambda **kw: real(**{**kw, "transport": httpx.MockTransport(handler)}),
     )
     monkeypatch.setattr(system, "_host_addresses", fake_dns)
     return SimpleNamespace(files=files, requested=requested)
@@ -348,3 +348,95 @@ async def test_fetch_url_checks_target_before_downloading(env, remote) -> None:
     assert res["status"] == "error"
     assert "999" in res["error"]
     assert remote.requested == []
+
+
+# --- the connect-time guard (real sockets) -----------------------------------
+
+
+@pytest.fixture
+def loopback_server():
+    """A real HTTP server on 127.0.0.1 holding a "secret" only reachable locally."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = b"LOOPBACK-ONLY-SECRET " + self.headers.get("Host", "").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_address[1]
+    server.shutdown()
+
+
+def _dns_sequence(monkeypatch: pytest.MonkeyPatch, answers: list) -> None:
+    """Each lookup of a ``.test`` name pops the next answer (an exception is
+    raised). Patched at socket.getaddrinfo, so the guard's lookups and the
+    connect's own lookup (if any) both see the sequence."""
+    import socket
+
+    real = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        name = host.decode() if isinstance(host, bytes) else str(host)  # anyio passes IDNA bytes
+        if not name.endswith(".test"):
+            return real(host, port, *args, **kwargs)
+        answer = answers.pop(0) if len(answers) > 1 else answers[0]
+        if isinstance(answer, Exception):
+            raise socket.gaierror(str(answer))
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0)) for ip in answer
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        # DNS rebinding: public for the early check, loopback for the connect.
+        [["93.184.216.34"], ["127.0.0.1"]],
+        # Lookup error first: the early check lets it through, the connect
+        # must not.
+        [OSError("SERVFAIL"), ["127.0.0.1"]],
+    ],
+)
+async def test_fetch_url_connects_only_to_the_checked_address(
+    env, loopback_server, monkeypatch: pytest.MonkeyPatch, answers,
+) -> None:
+    _dns_sequence(monkeypatch, answers)
+    res = await env.tools["proxmox_fetch_url"](
+        node=NODE, vmid=CT, url=f"http://rebind.test:{loopback_server}/", dest="/x",
+    )
+    assert res["status"] == "error", res
+    assert env.ssh.guest_files == {}
+
+
+async def test_fetch_url_unresolvable_host_fails_closed(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    _dns_sequence(monkeypatch, [OSError("NXDOMAIN")])
+    res = await env.tools["proxmox_fetch_url"](
+        node=NODE, vmid=CT, url="http://nowhere.test/", dest="/x",
+    )
+    assert res["status"] == "error"
+    assert env.ssh.guest_files == {}
+
+
+async def test_guarded_connect_keeps_the_hostname(
+    env, loopback_server, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pretend 127.0.0.1 is a public address to exercise the success path:
+    # the connection goes to the resolved IP, the Host header keeps the name.
+    _dns_sequence(monkeypatch, [["127.0.0.1"]])
+    monkeypatch.setattr(system, "_is_local_address", lambda addr: False)
+    res = await env.tools["proxmox_fetch_url"](
+        node=NODE, vmid=CT, url=f"http://files.test:{loopback_server}/f", dest="/f",
+    )
+    assert res["status"] == "success", res
+    assert env.ssh.guest_files["/f"] == f"LOOPBACK-ONLY-SECRET files.test:{loopback_server}".encode()

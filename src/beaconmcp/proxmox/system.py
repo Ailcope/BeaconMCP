@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpcore
 import httpx
 from mcp.server.mcpserver import MCPServer
 
@@ -255,9 +256,11 @@ async def _refuse_local_target(request: httpx.Request) -> None:
 
     Keeps proxmox_fetch_url from reading services that only listen on the
     BeaconMCP host (its own /metrics, the Proxmox API on 127.0.0.1) or a
-    cloud metadata endpoint into a guest. The address is resolved here and
-    again by httpx when it connects, so a DNS answer that changes in between
-    is not covered; this is a guard rail, not a sandbox.
+    cloud metadata endpoint into a guest. This early check gives a clear
+    error before any connection; the one that holds is
+    :class:`_GuardedNetworkBackend`, which connects to the very address it
+    checked (a DNS answer that changes between two lookups can't slip a
+    loopback address past it).
     """
     host = request.url.host
     try:
@@ -274,6 +277,64 @@ async def _refuse_local_target(request: httpx.Request) -> None:
             f"Refusing to fetch from {host} ({local}): loopback and link-local "
             "addresses are not allowed."
         )
+
+
+class _GuardedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Resolve once, refuse local addresses, connect to the checked IP.
+
+    TLS still verifies against the URL's hostname: httpcore takes the SNI
+    and certificate name from the request origin, not from this address.
+    Resolution failures fail closed.
+    """
+
+    def __init__(self) -> None:
+        self._inner = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            ipaddress.ip_address(host)
+            addrs = [host]
+        except ValueError:
+            try:
+                addrs = await _host_addresses(host)
+            except OSError as e:
+                raise httpcore.ConnectError(f"cannot resolve {host}: {e}") from e
+        if not addrs:
+            raise httpcore.ConnectError(f"cannot resolve {host}")
+        local = next((a for a in addrs if _is_local_address(a)), None)
+        if local is not None:
+            raise _LocalTargetRefused(
+                f"Refusing to fetch from {host} ({local}): loopback and link-local "
+                "addresses are not allowed."
+            )
+        return await self._inner.connect_tcp(
+            addrs[0], port, timeout=timeout,
+            local_address=local_address, socket_options=socket_options,
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _fetch_transport() -> httpx.AsyncBaseTransport:
+    """Transport for proxmox_fetch_url: every connection goes through the guard.
+
+    Passing a transport also turns off HTTP(S)_PROXY from the environment:
+    a proxy would resolve the name itself, out of the guard's reach.
+    """
+    transport = httpx.AsyncHTTPTransport()
+    transport._pool = httpcore.AsyncConnectionPool(
+        ssl_context=httpx.create_ssl_context(),
+        network_backend=_GuardedNetworkBackend(),
+    )
+    return transport
 
 
 async def _push_staged(
@@ -939,6 +1000,7 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=min(max(timeout, 10), 1800),
                 event_hooks={"request": [_refuse_local_target]},
+                transport=_fetch_transport(),
             ) as http:
                 async with http.stream("GET", url) as resp:
                     if resp.status_code >= 400:

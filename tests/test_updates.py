@@ -374,6 +374,7 @@ def test_apply_pulls_installs_validates_and_restarts(
     _advance(upstream, "feat: shiny")
     install = _install(checkout)
     install.service = "beaconmcp"
+    install.under_systemd = True
 
     result = updates.apply_update(install=install, restart_delay=3)
 
@@ -609,7 +610,7 @@ def test_restart_with_a_watchdog_runs_as_its_own_transient_unit(monkeypatch, tmp
     assert cmd[script_at + 1:] == [
         "beaconmcp-update", "5", "beaconmcp", "http://127.0.0.1:8420/health",
         str(tmp_path), "a" * 40, "b" * 40, "/opt/venv/bin/python",
-        str(tmp_path / updates.STATUS_FILE), str(updates.HEALTH_WAIT_SECONDS), "10",
+        str(tmp_path / updates.STATUS_FILE), str(updates.HEALTH_WAIT_SECONDS), str(updates._SETTLE_SECONDS),
         "/opt/venv/bin/pip",
     ]
 
@@ -721,6 +722,7 @@ def test_apply_hands_the_watchdog_both_revisions(checkout, upstream, monkeypatch
     _advance(upstream, "feat: thing")
     install = _install(checkout)
     install.service = "beaconmcp"
+    install.under_systemd = True
 
     result = updates.apply_update(install=install)
 
@@ -797,6 +799,43 @@ def test_release_channel_follows_the_newest_version_tag(checkout, upstream, stub
     result = updates.apply_update(install=_install(checkout), settings=RELEASE)
     assert result.ok is True
     assert _head(checkout) == tagged, "must stop at the tag, not the branch tip"
+
+
+def test_release_channel_survives_a_moved_tag(checkout, upstream, stub_side_effects):
+    _advance(upstream, "release v1.0.0")
+    _tag(upstream, "v1.0.0")
+    _run("git", "fetch", "--quiet", "--tags", "origin", cwd=checkout)
+    assert updates.check_for_update(install=_install(checkout), settings=RELEASE).release_tag == "v1.0.0"
+    # Upstream re-tags v1.0.0 to fix the release, then ships v1.1.0. A plain
+    # `fetch --tags` now exits 1 ("would clobber existing tag") forever.
+    _advance(upstream, "fix the release")
+    _run("git", "tag", "-f", "-a", "-m", "v1.0.0", "v1.0.0", cwd=upstream)
+    _advance(upstream, "release v1.1.0")
+    _tag(upstream, "v1.1.0")
+
+    info = updates.check_for_update(install=_install(checkout), settings=RELEASE)
+    assert info.error is None, info.error
+    assert info.release_tag == "v1.1.0"
+
+
+def test_require_signed_refuses_a_tag_object_under_another_name(
+    checkout, upstream, stub_side_effects, gpg_signer,
+):
+    # A signed pre-release, republished under a release name.
+    _advance(upstream, "release v2.0.0-rc1")
+    _tag(upstream, "v2.0.0-rc1", signed=True)
+    obj = subprocess.run(
+        ["git", "rev-parse", "refs/tags/v2.0.0-rc1"], cwd=str(upstream),
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    _run("git", "update-ref", "refs/tags/v2.0.0", obj, cwd=upstream)
+    before = _head(checkout)
+
+    result = updates.apply_update(install=_install(checkout), settings=SIGNED_RELEASE)
+
+    assert result.ok is False
+    assert "v2.0.0-rc1" in result.steps[-1].detail
+    assert _head(checkout) == before
 
 
 def test_release_channel_without_tags_says_so(checkout, upstream, stub_side_effects):
@@ -931,12 +970,21 @@ def _exe(path: Path, body: str) -> Path:
     return path
 
 
-def _run_watchdog(tmp_path, checkout, from_sha, to_sha, probe_body):
-    """Run _WATCHDOG_SCRIPT with fake systemctl, pip and health probe."""
+def _run_watchdog(
+    tmp_path, checkout, from_sha, to_sha, probe_body, *, settle="0", show_body="echo 1; echo 0\n",
+):
+    """Run _WATCHDOG_SCRIPT with fake systemctl, pip and health probe.
+
+    ``systemctl show`` (MainPID, NRestarts) answers through ``show_body`` and
+    is left out of the call log; every other systemctl call is logged.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "calls.log"
-    _exe(bindir / "systemctl", f'echo "systemctl $*" >> {log}\n')
+    _exe(
+        bindir / "systemctl",
+        f'if [ "$1" = show ]; then\n{show_body}exit 0\nfi\necho "systemctl $*" >> {log}\n',
+    )
     pip = _exe(bindir / "fake-pip", f'echo "pip $* (in $(pwd))" >> {log}\n')
     # Stands in for "$py -c <probe> <url>": healthy or not, by exit code.
     probe = _exe(bindir / "fake-python", probe_body)
@@ -944,7 +992,7 @@ def _run_watchdog(tmp_path, checkout, from_sha, to_sha, probe_body):
     proc = subprocess.run(
         ["/bin/sh", "-c", updates._WATCHDOG_SCRIPT, "beaconmcp-update",
          "0", "beaconmcp", "http://127.0.0.1:1/health", str(checkout),
-         from_sha, to_sha, str(probe), str(status), "3", "0", str(pip)],
+         from_sha, to_sha, str(probe), str(status), "3", settle, str(pip)],
         capture_output=True, text=True, timeout=60,
         env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
     )
@@ -1013,6 +1061,52 @@ def test_watchdog_does_not_undo_a_newer_update(tmp_path, checkout, upstream):
     assert proc.returncode == 1
     assert _head(checkout) == newer
     assert status["outcome"] == "superseded"
+
+
+def test_watchdog_script_survives_systemd_expansion():
+    # PID 1 expands ${VAR} and collapses $$ in a transient unit's ExecStart,
+    # script text included: ${10} once reached sh as an empty settle.
+    assert "${" not in updates._WATCHDOG_SCRIPT
+    assert "$$" not in updates._WATCHDOG_SCRIPT
+
+
+def test_watchdog_rolls_back_a_crash_loop_that_answers_between_restarts(
+    tmp_path, checkout, upstream,
+):
+    from_sha = _head(checkout)
+    _advance(upstream, "feat: dies a few seconds after each start")
+    _run("git", "pull", "--ff-only", cwd=checkout)
+    to_sha = _head(checkout)
+
+    # /health answers every time it is probed, but on the new revision every
+    # probe meets a new MainPID: systemd keeps restarting a crashing process.
+    show = (
+        f'if [ "$(git -C {checkout} rev-parse HEAD)" = "{to_sha}" ]; then '
+        'date +%s%N; else echo 1; fi; echo 0\n'
+    )
+    proc, _, status = _run_watchdog(
+        tmp_path, checkout, from_sha, to_sha, "exit 0\n", settle="2", show_body=show,
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert status["outcome"] == "rolled_back"
+    assert _head(checkout) == from_sha
+
+
+def test_no_restart_when_the_server_runs_outside_its_unit(checkout, upstream, stub_side_effects):
+    # The unit file exists, but this process was started by hand: restarting
+    # the unit would leave it answering /health for code it never loaded.
+    _advance(upstream, "feat: thing")
+    install = _install(checkout)
+    install.service = "beaconmcp"
+    install.under_systemd = False
+
+    result = updates.apply_update(install=install, restart_delay=3)
+
+    assert result.ok is True
+    assert result.restart_scheduled is False
+    assert "restart" not in [s.name for s in result.steps]
+    assert "Restart the server process" in result.message
 
 
 def test_check_reports_how_the_last_update_ended(checkout):

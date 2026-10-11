@@ -113,6 +113,11 @@ def _guest_argv(
     ``cmd.exe /c`` instead. When the agent can't report its OS (old agent,
     command blocked), assume a POSIX guest, which is by far the common case,
     and return a hint to attach to an exec error (``None`` when the OS is known).
+
+    On Windows the agent joins the argv into one command line with C runtime
+    quoting (``"`` becomes ``\\"``), which cmd.exe does not understand: a
+    command that itself contains double quotes can reach cmd.exe mangled.
+    Commands without inner double quotes are unaffected.
     """
     info = client.get(node, f"nodes/{node}/qemu/{vmid}/agent/get-osinfo")
     result = info.get("result") if isinstance(info, dict) else None

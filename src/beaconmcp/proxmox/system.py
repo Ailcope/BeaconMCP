@@ -187,10 +187,13 @@ def _agent_read_bytes(
     count = _FILE_READ_MAX_BYTES + 1
     result = client.get(node, api, file=path, count=count, decode=0)
     legacy = False
-    if isinstance(result, dict) and "error" in result and "decode" in str(result["error"]):
+    if isinstance(result, dict) and "error" in result and any(
+        name in str(result["error"]) for name in ("decode", "count")
+    ):
         # PVE before the `decode` parameter: content arrives decoded, one
-        # JSON code point per byte.
-        result = client.get(node, api, file=path, count=count)
+        # JSON code point per byte. `count` may be just as new, so it is left
+        # out too; the caller's length check still enforces the limit.
+        result = client.get(node, api, file=path)
         legacy = True
     if isinstance(result, dict) and "error" in result:
         return {"status": "error", "error": result["error"]}
@@ -321,10 +324,18 @@ class _GuardedNetworkBackend(httpcore.AsyncNetworkBackend):
                 f"Refusing to fetch from {host} ({local}): loopback and link-local "
                 "addresses are not allowed."
             )
-        return await self._inner.connect_tcp(
-            addrs[0], port, timeout=timeout,
-            local_address=local_address, socket_options=socket_options,
-        )
+        # Every address was checked above, so trying them in turn keeps the
+        # guarantee: an unreachable AAAA on an IPv4-only host must not end it.
+        last: Exception | None = None
+        for addr in addrs:
+            try:
+                return await self._inner.connect_tcp(
+                    addr, port, timeout=timeout,
+                    local_address=local_address, socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout, OSError) as e:
+                last = e
+        raise httpcore.ConnectError(f"cannot connect to {host}: {last}") from last
 
     async def sleep(self, seconds: float) -> None:
         await self._inner.sleep(seconds)
@@ -337,6 +348,9 @@ def _fetch_transport() -> httpx.AsyncBaseTransport:
     a proxy would resolve the name itself, out of the guard's reach.
     """
     transport = httpx.AsyncHTTPTransport()
+    # httpx has no public hook for the network backend; `_pool` is the pool
+    # every request goes through (checked against httpx 0.28.1 / httpcore
+    # 1.0.9, and pinned by test_upload_links' rebinding test).
     transport._pool = httpcore.AsyncConnectionPool(
         ssl_context=httpx.create_ssl_context(),
         network_backend=_GuardedNetworkBackend(),

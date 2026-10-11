@@ -181,8 +181,11 @@ class ProxmoxClient:
                 # already running, and a second POST would start it again.
                 if method != "get" and not _never_sent(e):
                     self._cache().pop(node_name, None)
+                    what = "did not answer in time" if isinstance(e, Timeout) else (
+                        "dropped the connection mid-request"
+                    )
                     return {
-                        "error": f"Node '{node_name}' did not answer in time: {e}. "
+                        "error": f"Node '{node_name}' {what}: {e}. "
                         "The request may still have been applied; check "
                         "proxmox_get_tasks before retrying."
                     }

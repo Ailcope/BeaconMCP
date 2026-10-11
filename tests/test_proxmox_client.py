@@ -225,3 +225,10 @@ def test_get_is_retried_after_a_read_timeout(monkeypatch: pytest.MonkeyPatch) ->
     ep = _Endpoint(ReadTimeout("read timed out"))
     _client_with(monkeypatch, ep).get("pve1", "nodes")
     assert ep.calls == 2
+
+
+def test_a_dropped_write_is_not_called_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    ep = _Endpoint(RequestsConnectionError("Connection aborted: RemoteDisconnected"))
+    result = _client_with(monkeypatch, ep).post("pve1", "nodes")
+    assert ep.calls == 1
+    assert "dropped the connection mid-request" in result["error"]

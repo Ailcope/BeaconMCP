@@ -469,7 +469,7 @@ async def _push_staged(
             "error": (
                 f"VM {vmid} is not reachable via SSH ({e}). "
                 "Either declare it under ssh.hosts[] (or set ssh.vmid_to_ip), "
-                "or use proxmox_write_file for files ≤1MB."
+                "or use proxmox_write_file for files up to 45 KiB."
             ),
         }
     # SFTP put into an existing directory would drop the file inside it
@@ -642,7 +642,7 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
         - **VM**: SFTP-streams directly into the VM. The VM must be
           SSH-reachable — declared under ``ssh.hosts[]`` or matched by
           ``ssh.vmid_to_ip``. For VMs without SSH, fall back to
-          ``proxmox_write_file`` (1 MB cap).
+          ``proxmox_write_file`` (45 KiB cap).
 
         When ``verify_checksum=True``, computes a SHA-256 locally and
         re-checks it inside the guest after transfer. If the guest lacks

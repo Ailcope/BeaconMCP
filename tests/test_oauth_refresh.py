@@ -117,6 +117,27 @@ def test_replayed_refresh_token_revokes_whole_family() -> None:
         store.refresh(second.refresh_token, "client-a")
 
 
+def test_reuse_is_detected_after_a_short_refresh_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With refresh_token_ttl below the family lifetime, a rotated-out token
+    # replayed after its own idle TTL must still count as reuse, not as an
+    # unknown token that leaves the family alive.
+    now = 1_000_000.0
+    _clock(monkeypatch, now)
+    store = TokenStore(refresh_token_ttl=3600)
+    first = store.issue_oauth("client-a", refresh=True)
+    _clock(monkeypatch, now + 600)
+    second = store.refresh(first.refresh_token, "client-a")
+
+    _clock(monkeypatch, now + 4200)  # past R1's own 1 h TTL, family still alive
+    store._cleanup()
+    with pytest.raises(RefreshTokenError) as exc:
+        store.refresh(first.refresh_token, "client-a")
+    assert exc.value.reason == "reused"
+    assert store.validate(second.access_token) is None
+    with pytest.raises(RefreshTokenError):
+        store.refresh(second.refresh_token, "client-a")
+
+
 def test_reuse_does_not_touch_other_families() -> None:
     store = TokenStore()
     a = store.issue_oauth("client-a", refresh=True)

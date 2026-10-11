@@ -992,6 +992,17 @@ class TokenStore:
             rt = self._refresh_tokens.get(_hash_secret(refresh_token))
             if rt is None or rt.client_id != client_id:
                 raise RefreshTokenError("invalid")
+            # Reuse is checked before the token's own idle expiry: a
+            # rotated-out token replayed after its idle TTL is still a
+            # stolen copy, and must still take the family down.
+            if rt.used and now < rt.family_expires_at:
+                if (
+                    rt.replay is not None
+                    and now - rt.used_at <= self.REFRESH_REUSE_GRACE
+                ):
+                    return rt.replay
+                self.revoke_family(rt.family_id)
+                raise RefreshTokenError("reused", family_id=rt.family_id)
             if now > rt.expires_at or now >= rt.family_expires_at:
                 # The whole sign-in is over with the family end; a token
                 # that idled past its own TTL only takes itself out.
@@ -1000,16 +1011,12 @@ class TokenStore:
                 else:
                     self._drop_refresh(rt.token_hash)
                 raise RefreshTokenError("expired", family_id=rt.family_id)
-            if rt.used:
-                if (
-                    rt.replay is not None
-                    and now - rt.used_at <= self.REFRESH_REUSE_GRACE
-                ):
-                    return rt.replay
-                self.revoke_family(rt.family_id)
-                raise RefreshTokenError("reused", family_id=rt.family_id)
             rt.used = True
             rt.used_at = now
+            # Keep the rotated-out token until the family ends (not its own
+            # idle expiry, shorter with a custom refresh_token_ttl) so a
+            # replay is still recognised as reuse.
+            rt.expires_at = rt.family_expires_at
             self._persist_refresh(rt)
             grant = self._mint_oauth(client_id, rt.family_id, rt.family_expires_at)
             rt.replay = grant

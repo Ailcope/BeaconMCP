@@ -108,6 +108,41 @@ def test_success_does_not_reset_the_per_client_cap(clock) -> None:
         for _ in range(4):
             guard.record_failure("c1", f"203.0.113.{i}")
     guard.record_success("c1", OWNER)
+    # The owner's own source is exempt now, every other one stays locked.
+    assert not guard.locked("c1", OWNER)
+    assert guard.locked("c1", "203.0.113.200")
+
+
+def test_known_good_source_survives_a_distributed_lockout(clock) -> None:
+    """Two attacker IPs at the per-source limit must not lock the owner out
+    of every TOTP path once the owner has logged in from their address."""
+    guard = TotpLockout()
+    guard.record_success("c1", OWNER)
+    for ip in ("203.0.113.1", "203.0.113.2"):
+        for _ in range(5):
+            guard.record_failure("c1", ip)
+    assert not guard.locked("c1", OWNER)
+    assert guard.locked("c1", "203.0.113.3")
+
+
+def test_known_good_source_still_has_its_own_cap(clock) -> None:
+    guard = TotpLockout()
+    guard.record_success("c1", OWNER)
+    for _ in range(5):
+        guard.record_failure("c1", OWNER)
+    assert guard.locked("c1", OWNER)
+
+
+def test_known_good_expires(clock) -> None:
+    guard = TotpLockout(known_good_seconds=60)
+    guard.record_success("c1", OWNER)
+    for ip in ("203.0.113.1", "203.0.113.2"):
+        for _ in range(5):
+            guard.record_failure("c1", ip)
+    clock.now += 61
+    for ip in ("203.0.113.4", "203.0.113.5"):
+        for _ in range(5):
+            guard.record_failure("c1", ip)
     assert guard.locked("c1", OWNER)
 
 
@@ -139,9 +174,24 @@ def test_forwarded_header_without_trusted_proxies_warns_once(caplog, monkeypatch
     with caplog.at_level("WARNING", logger="beaconmcp"):
         assert ratelimit.client_ip(request) == "10.0.0.2"
         ratelimit.client_ip(request)
-    warnings = [r for r in caplog.records if "trusted_proxies is empty" in r.getMessage()]
+    warnings = [r for r in caplog.records if "not in server.trusted_proxies" in r.getMessage()]
     assert len(warnings) == 1
     assert "10.0.0.2" in warnings[0].getMessage()
+
+
+def test_forwarded_header_from_an_unlisted_proxy_warns(caplog, monkeypatch) -> None:
+    """``trusted_proxies: [cloudflare]`` doesn't cover a cloudflared tunnel,
+    which connects from its own LAN address: say so instead of staying quiet."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ratelimit, "_forwarding_warned", False)
+    request = SimpleNamespace(
+        client=SimpleNamespace(host="192.168.1.201"),
+        headers={"x-forwarded-for": ATTACKER},
+    )
+    with caplog.at_level("WARNING", logger="beaconmcp"):
+        assert ratelimit.client_ip(request, ("127.0.0.1", "173.245.48.0/20")) == "192.168.1.201"
+    assert [r for r in caplog.records if "192.168.1.201" in r.getMessage()]
 
 
 def test_no_warning_when_the_proxy_is_trusted(caplog, monkeypatch) -> None:

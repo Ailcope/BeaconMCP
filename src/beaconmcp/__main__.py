@@ -1343,9 +1343,24 @@ def _run_http(mcp, host: str, port: int, *, serve: bool = True):
     # client_id alone, anyone who knew a client_id could lock its owner out
     # of every 2FA path.
     totp_lockout = TotpLockout(per_source=5, per_client=10, lockout_seconds=300)
-    totp_locked = totp_lockout.locked
-    totp_record_failure = totp_lockout.record_failure
-    totp_record_success = totp_lockout.record_success
+
+    # A derived (DCR) client checks codes against its owner's seed, so the
+    # lockout is keyed on the seed owner: otherwise every derived client_id
+    # would get its own guess budget against the same seed.
+    def _seed_owner(client_id: str) -> str:
+        client = client_store.get(client_id)
+        if client is not None and client.owner_client_id:
+            return client.owner_client_id
+        return client_id
+
+    def totp_locked(client_id: str, ip: str | None = None) -> bool:
+        return totp_lockout.locked(_seed_owner(client_id), ip)
+
+    def totp_record_failure(client_id: str, ip: str | None = None) -> None:
+        totp_lockout.record_failure(_seed_owner(client_id), ip)
+
+    def totp_record_success(client_id: str, ip: str | None = None) -> None:
+        totp_lockout.record_success(_seed_owner(client_id), ip)
 
     def _ip(request: Request) -> str:
         return client_ip(request, tuple(config.server.trusted_proxies))

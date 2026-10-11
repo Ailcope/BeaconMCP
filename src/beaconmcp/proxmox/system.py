@@ -160,6 +160,40 @@ def _sha256_file(path: Path) -> str:
 
 # Hard cap for the guest-agent file-read path (matches proxmox_write_file).
 _FILE_READ_MAX_BYTES = 1024 * 1024
+#: PVE caps agent/file-write ``content`` at 60 KiB, and the content goes
+#: base64-encoded (4/3 larger): 45 KiB of raw bytes is what fits.
+_FILE_WRITE_MAX_BYTES = 45 * 1024
+
+
+def _agent_read_bytes(
+    client: ProxmoxClient, node: str, vmid: int, path: str,
+) -> bytes | dict[str, Any]:
+    """Raw bytes of a guest file via agent/file-read, or an error result.
+
+    Reads one byte past the limit so an oversized file is told apart from
+    one exactly at it. ``decode=0`` keeps the guest agent's base64 as is:
+    PVE's default decodes it server-side and the bytes then come back as
+    JSON text, which isn't base64 any more.
+    """
+    api = f"nodes/{node}/qemu/{vmid}/agent/file-read"
+    count = _FILE_READ_MAX_BYTES + 1
+    result = client.get(node, api, file=path, count=count, decode=0)
+    legacy = False
+    if isinstance(result, dict) and "error" in result and "decode" in str(result["error"]):
+        # PVE before the `decode` parameter: content arrives decoded, one
+        # JSON code point per byte.
+        result = client.get(node, api, file=path, count=count)
+        legacy = True
+    if isinstance(result, dict) and "error" in result:
+        return {"status": "error", "error": result["error"]}
+    if not isinstance(result, dict) or not isinstance(result.get("content"), str):
+        return {"status": "error", "error": f"Unexpected file-read response: {result!r}"[:300]}
+    try:
+        if legacy:
+            return result["content"].encode("latin-1")
+        return base64.b64decode(result["content"], validate=True)
+    except (ValueError, UnicodeEncodeError) as e:
+        return {"status": "error", "error": f"Failed to decode file content: {e}"}
 
 
 def _qemu_file_size(client: ProxmoxClient, node: str, vmid: int, path: str) -> int | None:
@@ -401,31 +435,26 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
                         "limit. Use proxmox_download_file for large files."
                     ),
                 }
-            result = await loop.run_in_executor(
-                None,
-                lambda: client.get(node, f"nodes/{node}/qemu/{vmid}/agent/file-read", file=path),
+            data = await loop.run_in_executor(
+                None, _agent_read_bytes, client, node, vmid, path,
             )
-            if isinstance(result, dict) and "error" in result:
-                return {"status": "error", "error": result["error"]}
-            # QEMU Guest Agent returns file content base64-encoded
+            if isinstance(data, dict):
+                return data
+            if len(data) > _FILE_READ_MAX_BYTES:
+                return {
+                    "status": "error",
+                    "error": "File exceeds the 1MB guest-agent read limit. Use proxmox_download_file for large files.",
+                }
+            if binary:
+                return {
+                    "status": "success", "vmid": vmid, "node": node, "path": path,
+                    "content_base64": base64.b64encode(data).decode("ascii"),
+                }
             try:
-                if isinstance(result, dict) and "content" in result:
-                    import base64
-                    raw_b64 = result["content"]
-                    if len(raw_b64) > 1398101: # ~1MB limit in base64
-                        return {"status": "error", "error": "File exceeds 1MB limit. Use SSH to download large files."}
-                    
-                    if binary:
-                        return {"status": "success", "vmid": vmid, "node": node, "path": path, "content_base64": raw_b64}
-                        
-                    try:
-                        content = base64.b64decode(raw_b64).decode("utf-8")
-                        return {"status": "success", "vmid": vmid, "node": node, "path": path, "content": content}
-                    except UnicodeDecodeError:
-                        return {"status": "error", "error": "Binary data detected. Pass binary=True to retrieve as base64."}
-                return {"status": "success", "vmid": vmid, "node": node, "path": path, "content": str(result)}
-            except Exception as e:
-                return {"status": "error", "error": f"Failed to decode file content: {e}"}
+                content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return {"status": "error", "error": "Binary data detected. Pass binary=True to retrieve as base64."}
+            return {"status": "success", "vmid": vmid, "node": node, "path": path, "content": content}
         
         return {"status": "error", "error": "LXC file reading is currently unsupported via API. Please use ssh_run to cat the file."}
 
@@ -442,17 +471,26 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
         if not vm_type:
             return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
             
-        if len(content.encode("utf-8")) > 1024 * 1024:
-            return {"status": "error", "error": "Content exceeds 1MB limit. Use SSH for large files."}
-            
+        raw = content.encode("utf-8")
+        if len(raw) > _FILE_WRITE_MAX_BYTES:
+            return {
+                "status": "error",
+                "error": (
+                    f"Content is {len(raw)} bytes, over the {_FILE_WRITE_MAX_BYTES} byte "
+                    "guest-agent write limit. Use proxmox_upload_link or proxmox_upload_file."
+                ),
+            }
+
         if vm_type == "qemu":
-            import base64
-            encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+            # encode=0: the content is already base64. With PVE's default
+            # (encode=1) it would be encoded a second time and the guest
+            # would get the base64 text instead of the file.
+            encoded = base64.b64encode(raw).decode("ascii")
             result = await loop.run_in_executor(
                 None,
                 lambda: client.post(
                     node, f"nodes/{node}/qemu/{vmid}/agent/file-write",
-                    file=path, content=encoded, encode=1,
+                    file=path, content=encoded, encode=0,
                 ),
             )
             if isinstance(result, dict) and "error" in result:

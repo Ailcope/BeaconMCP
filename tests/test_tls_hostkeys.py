@@ -331,3 +331,28 @@ async def test_tofu_parallel_first_contacts_both_accept_the_same_key(tmp_path) -
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_tofu_keeps_ports_apart(tmp_path) -> None:
+    """A key pinned for port 22 says nothing about another port on that address.
+
+    Port forwards on one NAT address usually lead to different machines;
+    asyncssh's matcher would retry ``[host]:port`` as plain ``host``.
+    """
+    cfg = _load(tmp_path, _ssh())
+    server = await _serve(asyncssh.generate_private_key("ssh-ed25519"))
+    try:
+        spec = cfg.get_ssh_host("h")
+        spec.host, spec.port = "127.0.0.1", server.sockets[0].getsockname()[1]
+        policy = host_key_policy(cfg, spec)
+        other = asyncssh.generate_private_key("ssh-ed25519").export_public_key("openssh")
+        kh = Path(policy.path)
+        kh.parent.mkdir(parents=True, exist_ok=True)
+        kh.write_text(f"127.0.0.1 {other.decode().strip()}\n")
+
+        conn = await _connect_to_host(spec, policy)
+        conn.close()
+        assert kh.read_text().splitlines()[1].startswith(f"[127.0.0.1]:{spec.port} ")
+    finally:
+        server.close()
+        await server.wait_closed()

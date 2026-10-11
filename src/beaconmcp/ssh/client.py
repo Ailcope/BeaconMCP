@@ -115,10 +115,29 @@ def _known_host_pattern(host: str, port: int) -> str:
     return host if port == 22 else f"[{host}]:{port}"
 
 
-def _load_known_hosts(path: str) -> asyncssh.SSHKnownHosts:
-    if os.path.isfile(path):
-        return asyncssh.read_known_hosts(path)
-    return asyncssh.import_known_hosts("")
+def _pinned_keys(path: str, host: str, port: int) -> list[asyncssh.SSHKey]:
+    """Keys recorded in the managed file for exactly ``host`` on ``port``.
+
+    asyncssh's own matching retries a non-22 port without the port, so a
+    ``[host]:2222`` target would be checked against the key of ``host`` on
+    port 22, which is often a different machine behind the same NAT address.
+    """
+    if not os.path.isfile(path):
+        return []
+    pattern = _known_host_pattern(host, port)
+    keys: list[asyncssh.SSHKey] = []
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            parts = raw.split()
+            if len(parts) < 3 or parts[0].startswith(("#", "@")):
+                continue
+            if pattern not in parts[0].split(","):
+                continue
+            try:
+                keys.append(asyncssh.import_public_key(f"{parts[1]} {parts[2]}"))
+            except (asyncssh.KeyImportError, ValueError):
+                continue
+    return keys
 
 
 class _TofuClient(asyncssh.SSHClient):
@@ -139,7 +158,7 @@ class _TofuClient(asyncssh.SSHClient):
 
     def validate_host_public_key(self, host: str, addr: str, port: int, key) -> bool:
         with _tofu_lock:
-            pinned = _load_known_hosts(self._path).match(host, addr, port)[0]
+            pinned = _pinned_keys(self._path, self._host, self._port)
             if key in pinned:
                 return True
             if pinned:
@@ -176,7 +195,9 @@ async def _connect_to_host(
         connect_kwargs["known_hosts"] = None
     elif policy.mode == "tofu":
         assert policy.path is not None
-        connect_kwargs["known_hosts"] = _load_known_hosts(policy.path)
+        connect_kwargs["known_hosts"] = (
+            _pinned_keys(policy.path, spec.host, spec.port), [], [],
+        )
         tofu_client = _TofuClient(policy.path, spec.host, spec.port)
         connect_kwargs["client_factory"] = lambda: tofu_client
     # "system": omit the kwarg -> asyncssh uses ~/.ssh/known_hosts.

@@ -25,7 +25,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
@@ -227,9 +227,17 @@ class RefreshToken:
     family_id: str
     expires_at: float
     created_at: float
-    # Rotated out. Kept until it expires so a replay can be recognised as
-    # reuse (and the family revoked) instead of a plain unknown token.
+    # Rotated out. Kept (for a bounded time, see
+    # ``TokenStore.USED_REFRESH_RETENTION``) so a replay can be recognised
+    # as reuse (and the family revoked) instead of a plain unknown token.
     used: bool = False
+    # When it was rotated out, and the pair that rotation minted. Memory
+    # only, never persisted: they let a client that timed out and resent
+    # the very same refresh call get the pair it missed (see
+    # ``TokenStore.REFRESH_REUSE_GRACE``) instead of tripping reuse
+    # detection. Cleared once the grace window is over.
+    used_at: float = 0.0
+    replay: OAuthGrant | None = None
 
 
 @dataclass
@@ -284,11 +292,30 @@ def verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
 
 
 class ClientStore:
-    """Persistent client credential storage backed by a JSON file."""
+    """Persistent client credential storage backed by a JSON file.
+
+    The file is shared with the ``beaconmcp auth`` CLI, which runs in its
+    own process while the server is up. Every public method first checks
+    whether the file changed on disk and re-reads it if so, so an ``auth
+    revoke`` cuts the client off at its next request instead of at the next
+    restart, and a server-side save (DCR) can't overwrite a CLI change.
+    """
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or CLIENTS_FILE
         self._clients: dict[str, Client] = {}
+        # Guards ``_clients`` and the on-disk signature below: reads come
+        # from the event loop and worker threads alike, and a reload swaps
+        # the whole dict. Re-entrant because ``_load`` may call ``_save``.
+        self._lock = threading.RLock()
+        # (mtime_ns, size, inode) of the file as last read or written by
+        # this process. ``None`` when the file does not exist yet.
+        self._disk_sig: tuple[int, int, int] | None = None
+        # Called with the ids of the surviving clients after a reload that
+        # dropped at least one client. The server hooks
+        # ``TokenStore.prune_unknown_clients`` here so the revoked client's
+        # OAuth bearers and refresh tokens die with it.
+        self.on_clients_removed: Callable[[set[str]], object] | None = None
         # Last accepted TOTP timestep (30s counter) per seed owner, used to
         # reject replays of an already-consumed code. Keyed by the SEED owner
         # so two clients sharing one owner's seed can't each spend the same
@@ -297,8 +324,49 @@ class ClientStore:
         self._totp_lock = threading.Lock()
         self._load()
 
+    def _stat_sig(self) -> tuple[int, int, int] | None:
+        """Cheap change detector for the file: mtime alone is not enough,
+        two CLI writes inside one kernel tick share it, so size and inode
+        (``_save`` replaces the file, so the inode moves) are folded in."""
+        try:
+            st = self._path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    def _maybe_reload(self) -> None:
+        """Re-read ``clients.json`` if another process rewrote it."""
+        sig = self._stat_sig()
+        if sig is None or sig == self._disk_sig:
+            # Unchanged, or file gone: keep what we have. A missing file is
+            # not "no clients" -- it is more likely a broken deploy, and
+            # dropping every client (and their tokens) on it would be worse.
+            return
+        with self._lock:
+            if sig == self._disk_sig:
+                return
+            before = set(self._clients)
+            try:
+                self._load()
+            except (json.JSONDecodeError, OSError):
+                # Half-written or broken file: keep serving the current set
+                # rather than nothing, and don't retry until it changes again.
+                self._disk_sig = sig
+                return
+            removed = before - set(self._clients)
+            callback = self.on_clients_removed if removed else None
+        if removed:
+            _logger.info(
+                "%s changed on disk: %d client(s) removed (%s)",
+                self._path, len(removed), ", ".join(sorted(removed)),
+            )
+        if callback is not None:
+            callback(set(self._clients))
+
     def _load(self) -> None:
-        if not self._path.exists():
+        sig = self._stat_sig()
+        if sig is None:
+            self._disk_sig = None
             return
         try:
             data = json.loads(self._path.read_text())
@@ -315,6 +383,7 @@ class ClientStore:
         # empty seed). We log legacy-pre-2FA rows and drop them; we keep
         # dynamic rows.
         revoked: list[str] = []
+        clients: dict[str, Client] = {}
         for c in data.get("clients", []):
             has_secret = bool(c.get("totp_secret"))
             has_owner = bool(c.get("owner_client_id"))
@@ -322,7 +391,7 @@ class ClientStore:
                 revoked.append(f"{c.get('client_id', '?')} ({c.get('name', '?')})")
                 continue
             try:
-                self._clients[c["client_id"]] = Client(
+                clients[c["client_id"]] = Client(
                     client_id=c["client_id"],
                     client_secret_hash=c["client_secret_hash"],
                     name=c["name"],
@@ -334,6 +403,8 @@ class ClientStore:
             except (KeyError, TypeError):
                 revoked.append(f"{c.get('client_id', '?')} ({c.get('name', '?')})")
 
+        self._clients = clients
+        self._disk_sig = sig
         if revoked:
             _logger.warning(
                 "Revoked %d pre-2FA client(s) with no TOTP secret. "
@@ -343,6 +414,7 @@ class ClientStore:
             self._save()
 
     def _save(self) -> None:
+        """Write the file atomically, owner-only. Caller holds the lock."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "clients": [
@@ -367,6 +439,8 @@ class ClientStore:
         except OSError:
             pass
         os.replace(tmp, self._path)
+        # Our own write is not a change worth reloading.
+        self._disk_sig = self._stat_sig()
 
     def create(self, name: str) -> tuple[str, str, str]:
         """Create a new client.
@@ -379,18 +453,21 @@ class ClientStore:
         client_secret = "sk_" + secrets.token_hex(32)
         totp_secret = pyotp.random_base32()
 
-        self._clients[client_id] = Client(
-            client_id=client_id,
-            client_secret_hash=_hash_secret(client_secret),
-            name=name,
-            created_at=time.time(),
-            totp_secret=totp_secret,
-        )
-        self._save()
+        self._maybe_reload()
+        with self._lock:
+            self._clients[client_id] = Client(
+                client_id=client_id,
+                client_secret_hash=_hash_secret(client_secret),
+                name=name,
+                created_at=time.time(),
+                totp_secret=totp_secret,
+            )
+            self._save()
         return client_id, client_secret, totp_secret
 
     def verify(self, client_id: str, client_secret: str) -> bool:
         """Verify client credentials."""
+        self._maybe_reload()
         client = self._clients.get(client_id)
         if not client:
             return False
@@ -398,9 +475,11 @@ class ClientStore:
         return hmac.compare_digest(client.client_secret_hash, _hash_secret(client_secret))
 
     def exists(self, client_id: str) -> bool:
+        self._maybe_reload()
         return client_id in self._clients
 
     def get_name(self, client_id: str) -> str | None:
+        self._maybe_reload()
         client = self._clients.get(client_id)
         return client.name if client else None
 
@@ -430,6 +509,7 @@ class ClientStore:
         30 s step, a browser POST replay) is an honest mistake. Counting it
         as a failure would lock a legitimate operator out for 5 minutes.
         """
+        self._maybe_reload()
         client = self._clients.get(client_id)
         if not client:
             return TotpResult.INVALID
@@ -477,6 +557,7 @@ class ClientStore:
 
     def list_clients(self) -> list[dict[str, Any]]:
         """List all registered clients (without secrets)."""
+        self._maybe_reload()
         return [
             {
                 "client_id": c.client_id,
@@ -490,6 +571,7 @@ class ClientStore:
 
     def list_derived(self, owner_client_id: str) -> list[Client]:
         """Return every dynamic client delegating TOTP to this owner."""
+        self._maybe_reload()
         return [
             c for c in self._clients.values()
             if c.owner_client_id == owner_client_id
@@ -502,19 +584,21 @@ class ClientStore:
         it (a derived client can't authenticate without the owner's TOTP
         seed anyway — leaving orphaned rows around is pure clutter).
         """
-        client = self._clients.get(client_id)
-        if client is None:
-            return False
-        del self._clients[client_id]
-        # Cascade to derived clients when the deleted row was an owner.
-        if client.owner_client_id is None:
-            derived = [
-                c.client_id for c in self._clients.values()
-                if c.owner_client_id == client_id
-            ]
-            for cid in derived:
-                del self._clients[cid]
-        self._save()
+        self._maybe_reload()
+        with self._lock:
+            client = self._clients.get(client_id)
+            if client is None:
+                return False
+            del self._clients[client_id]
+            # Cascade to derived clients when the deleted row was an owner.
+            if client.owner_client_id is None:
+                derived = [
+                    c.client_id for c in self._clients.values()
+                    if c.owner_client_id == client_id
+                ]
+                for cid in derived:
+                    del self._clients[cid]
+            self._save()
         return True
 
     def create_dynamic(
@@ -530,23 +614,26 @@ class ClientStore:
         seed of its own; ``verify_totp`` for this client delegates to
         ``owner_client_id``'s seed. The owner MUST already exist.
         """
-        if owner_client_id not in self._clients:
-            raise ValueError(f"unknown owner_client_id: {owner_client_id!r}")
-        client_id = "beaconmcp_" + secrets.token_hex(8)
-        client_secret = "sk_" + secrets.token_hex(32)
-        self._clients[client_id] = Client(
-            client_id=client_id,
-            client_secret_hash=_hash_secret(client_secret),
-            name=name,
-            created_at=time.time(),
-            totp_secret="",
-            owner_client_id=owner_client_id,
-            registration_source=registration_source,
-        )
-        self._save()
+        self._maybe_reload()
+        with self._lock:
+            if owner_client_id not in self._clients:
+                raise ValueError(f"unknown owner_client_id: {owner_client_id!r}")
+            client_id = "beaconmcp_" + secrets.token_hex(8)
+            client_secret = "sk_" + secrets.token_hex(32)
+            self._clients[client_id] = Client(
+                client_id=client_id,
+                client_secret_hash=_hash_secret(client_secret),
+                name=name,
+                created_at=time.time(),
+                totp_secret="",
+                owner_client_id=owner_client_id,
+                registration_source=registration_source,
+            )
+            self._save()
         return client_id, client_secret
 
     def get(self, client_id: str) -> Client | None:
+        self._maybe_reload()
         return self._clients.get(client_id)
 
 
@@ -579,6 +666,17 @@ class TokenStore:
     # re-authenticate. Overridable via ``refresh_token_ttl``
     # (server.refresh_token_ttl / env); ``0`` means never expires.
     REFRESH_TOKEN_TTL = 3600 * 24 * 30  # 30 days
+    # How long a rotated-out refresh token is kept for reuse detection. It
+    # can't mint anything any more, so it doesn't need its full lifetime;
+    # this also bounds the table (and memory) when ``refresh_token_ttl`` is
+    # 0, where rows would otherwise never expire -- one per refresh, forever.
+    USED_REFRESH_RETENTION = 3600 * 24 * 30  # 30 days
+    # A refresh token presented again this soon after it was rotated out
+    # is treated as a retry of the same call (client timed out, resent)
+    # and gets the pair the first call minted, instead of being counted as
+    # reuse and killing the family -- which forced a TOTP re-login on a
+    # plain network retry. Strict RFC 9700 behaviour resumes after it.
+    REFRESH_REUSE_GRACE = 60.0
     # Cap on named tokens (the ones listed in the dashboard's API
     # tokens page). Internal dashboard-session bearers are unlimited
     # because a re-login always revokes the prior one.
@@ -656,6 +754,15 @@ class TokenStore:
             conn.commit()
             self._db = conn
             now = time.time()
+            # Rotated-out rows written before the retention cap existed
+            # kept the token's own expiry (``inf`` with refresh_token_ttl 0):
+            # bound them too, counting from their creation since the
+            # rotation time was not recorded.
+            conn.execute(
+                "UPDATE refresh_tokens SET expires_at = MIN(expires_at, created_at + ?) "
+                "WHERE used = 1",
+                (self.USED_REFRESH_RETENTION,),
+            )
             for row in conn.execute(
                 "SELECT token, client_id, name, expires_at, created_at "
                 "FROM named_tokens WHERE expires_at > ?",
@@ -837,18 +944,28 @@ class TokenStore:
         and there is no telling which. Raises :class:`RefreshTokenError`.
         """
         with self._lock:
+            now = time.time()
             rt = self._refresh_tokens.get(_hash_secret(refresh_token))
             if rt is None or rt.client_id != client_id:
                 raise RefreshTokenError("invalid")
-            if time.time() > rt.expires_at:
+            if now > rt.expires_at:
                 self._drop_refresh(rt.token_hash)
                 raise RefreshTokenError("expired", family_id=rt.family_id)
             if rt.used:
+                if (
+                    rt.replay is not None
+                    and now - rt.used_at <= self.REFRESH_REUSE_GRACE
+                ):
+                    return rt.replay
                 self.revoke_family(rt.family_id)
                 raise RefreshTokenError("reused", family_id=rt.family_id)
             rt.used = True
+            rt.used_at = now
+            # Kept for reuse detection only from here on: bound its stay.
+            rt.expires_at = min(rt.expires_at, now + self.USED_REFRESH_RETENTION)
             self._persist_refresh(rt)
             grant = self._mint_oauth(client_id, rt.family_id)
+            rt.replay = grant
             self._cleanup()
             return grant
 
@@ -1039,6 +1156,10 @@ class TokenStore:
             for h in [h for h, rt in self._refresh_tokens.items()
                       if now > rt.expires_at]:
                 self._drop_refresh(h)
+            # Raw pairs held for the retry grace are dropped once it's over.
+            for rt in self._refresh_tokens.values():
+                if rt.replay is not None and now - rt.used_at > self.REFRESH_REUSE_GRACE:
+                    rt.replay = None
 
 
 class CodeStore:

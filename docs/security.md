@@ -52,8 +52,15 @@ OAuth access tokens and refresh tokens also survive restarts. They are stored in
 tokens are only issued on the `authorization_code` grant (never on `client_credentials`, which keeps
 its TOTP-on-every-exchange rule). Each refresh rotates the token; replaying an already-used refresh
 token revokes every access and refresh token of that sign-in (`auth.token.refresh.reuse` in the
-audit log), and the client has to go through the authorization page again. Deleting a client, or
-calling `security_end_session`, drops its refresh tokens too.
+audit log), and the client has to go through the authorization page again. The one exception is a
+replay within 60 s of the rotation, which is read as the same client retrying after a network
+timeout and gets the pair the first call minted. Rotated-out tokens are kept for 30 days at most
+for that detection, even with `refresh_token_ttl: 0`. Deleting a client, or calling
+`security_end_session`, drops its refresh tokens too.
+
+`beaconmcp auth revoke` takes effect immediately, server running or not: the server re-reads
+`clients.json` when it changes on disk, and the revoked client's bearers, refresh tokens and named
+API tokens are refused from its next request on.
 
 `security_end_session` lets a client revoke its own bearer at the end of a task, which is a cheap way
 to shrink the replay window.

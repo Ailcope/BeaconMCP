@@ -23,6 +23,14 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _past_grace(store: TokenStore) -> None:
+    """Age every rotated-out token past the retry grace window, so a replay
+    is judged as reuse rather than as a retry of the same call."""
+    for rt in store._refresh_tokens.values():
+        if rt.used:
+            rt.used_at -= store.REFRESH_REUSE_GRACE + 1
+
+
 # --- issuance ----------------------------------------------------------------
 
 
@@ -72,6 +80,7 @@ def test_refresh_rotates_old_refresh_token_out() -> None:
     second = store.refresh(first.refresh_token, "client-a")
     assert second.refresh_token is not None
     # The rotated-out token can't be used again, the new one can.
+    _past_grace(store)
     with pytest.raises(RefreshTokenError):
         store.refresh(first.refresh_token, "client-a")
 
@@ -83,6 +92,7 @@ def test_replayed_refresh_token_revokes_whole_family() -> None:
     second = store.refresh(first.refresh_token, "client-a")
     assert second.refresh_token is not None
 
+    _past_grace(store)
     with pytest.raises(RefreshTokenError) as exc:
         store.refresh(first.refresh_token, "client-a")
     assert exc.value.reason == "reused"
@@ -101,10 +111,70 @@ def test_reuse_does_not_touch_other_families() -> None:
     b = store.issue_oauth("client-a", refresh=True)
     assert a.refresh_token is not None and b.refresh_token is not None
     store.refresh(a.refresh_token, "client-a")
+    _past_grace(store)
     with pytest.raises(RefreshTokenError):
         store.refresh(a.refresh_token, "client-a")
     assert store.validate(b.access_token) == "client-a"
     store.refresh(b.refresh_token, "client-a")
+
+
+# --- retry grace ---------------------------------------------------------------
+
+
+def test_retry_within_grace_gets_the_same_pair() -> None:
+    # A client that timed out and resent the same refresh call must not be
+    # treated as an attacker: it gets the pair the first call minted.
+    store = TokenStore()
+    first = store.issue_oauth("client-a", refresh=True)
+    assert first.refresh_token is not None
+    winner = store.refresh(first.refresh_token, "client-a")
+    retry = store.refresh(first.refresh_token, "client-a")
+    assert retry == winner
+    # The family is intact and keeps rotating normally.
+    assert store.validate(winner.access_token) == "client-a"
+    assert winner.refresh_token is not None
+    nxt = store.refresh(winner.refresh_token, "client-a")
+    assert nxt.refresh_token not in (first.refresh_token, winner.refresh_token)
+
+
+def test_replay_after_grace_revokes_family() -> None:
+    store = TokenStore()
+    first = store.issue_oauth("client-a", refresh=True)
+    assert first.refresh_token is not None
+    winner = store.refresh(first.refresh_token, "client-a")
+    _past_grace(store)
+    with pytest.raises(RefreshTokenError) as exc:
+        store.refresh(first.refresh_token, "client-a")
+    assert exc.value.reason == "reused"
+    assert store.validate(winner.access_token) is None
+
+
+def test_grace_pair_is_dropped_once_the_window_closes() -> None:
+    store = TokenStore()
+    first = store.issue_oauth("client-a", refresh=True)
+    assert first.refresh_token is not None
+    store.refresh(first.refresh_token, "client-a")
+    rt = store._refresh_tokens[_sha(first.refresh_token)]
+    assert rt.replay is not None
+    _past_grace(store)
+    store._cleanup()
+    assert rt.replay is None
+
+
+def test_retry_after_restart_is_strict(tmp_path: Path) -> None:
+    # The minted pair is memory-only (never raw in tokens.db), so a replay
+    # straight after a restart falls back to the RFC 9700 behaviour.
+    db = tmp_path / "tokens.db"
+    store = TokenStore(db_path=db)
+    first = store.issue_oauth("client-a", refresh=True)
+    assert first.refresh_token is not None
+    winner = store.refresh(first.refresh_token, "client-a")
+
+    reborn = TokenStore(db_path=db)
+    with pytest.raises(RefreshTokenError) as exc:
+        reborn.refresh(first.refresh_token, "client-a")
+    assert exc.value.reason == "reused"
+    assert reborn.validate(winner.access_token) is None
 
 
 def test_refresh_with_wrong_client_rejected() -> None:
@@ -152,6 +222,55 @@ def test_refresh_token_ttl_zero_never_expires() -> None:
     grant = store.issue_oauth("client-a", refresh=True)
     assert grant.refresh_token is not None
     assert store._refresh_tokens[_sha(grant.refresh_token)].expires_at == float("inf")
+
+
+def test_rotated_out_tokens_are_bounded_with_ttl_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # refresh_token_ttl 0 means the *live* token never expires. Rotated-out
+    # rows only serve reuse detection and used to inherit the infinite
+    # expiry: one row per refresh, forever, in the table and in memory.
+    store = TokenStore(refresh_token_ttl=0)
+    grant = store.issue_oauth("client-a", refresh=True)
+    for _ in range(5):
+        assert grant.refresh_token is not None
+        grant = store.refresh(grant.refresh_token, "client-a")
+    assert grant.refresh_token is not None
+    assert store._refresh_tokens[_sha(grant.refresh_token)].expires_at == float("inf")
+    used = [rt for rt in store._refresh_tokens.values() if rt.used]
+    assert len(used) == 5
+    horizon = time.time() + store.USED_REFRESH_RETENTION
+    assert all(rt.expires_at <= horizon for rt in used)
+
+    later = horizon + 1
+    monkeypatch.setattr("beaconmcp.auth.time.time", lambda: later)
+    store._cleanup()
+    assert set(store._refresh_tokens) == {_sha(grant.refresh_token)}
+
+
+def test_used_rows_with_infinite_expiry_are_bounded_on_load(tmp_path: Path) -> None:
+    db = tmp_path / "tokens.db"
+    store = TokenStore(db_path=db, refresh_token_ttl=0)
+    first = store.issue_oauth("client-a", refresh=True)
+    assert first.refresh_token is not None
+    second = store.refresh(first.refresh_token, "client-a")
+    assert second.refresh_token is not None
+    # A rotated-out row written before the retention cap existed.
+    assert store._db is not None
+    store._db.execute(
+        "UPDATE refresh_tokens SET expires_at = ? WHERE used = 1", (float("inf"),),
+    )
+    store._db.commit()
+
+    reborn = TokenStore(db_path=db, refresh_token_ttl=0)
+    used = reborn._refresh_tokens[_sha(first.refresh_token)]
+    assert used.used
+    assert used.expires_at <= used.created_at + reborn.USED_REFRESH_RETENTION
+    assert reborn._refresh_tokens[_sha(second.refresh_token)].expires_at == float("inf")
+    # Still caught as reuse after the restart.
+    with pytest.raises(RefreshTokenError) as exc:
+        reborn.refresh(first.refresh_token, "client-a")
+    assert exc.value.reason == "reused"
 
 
 # --- revocation --------------------------------------------------------------

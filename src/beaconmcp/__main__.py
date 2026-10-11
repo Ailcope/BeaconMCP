@@ -1175,11 +1175,15 @@ def _run_http(mcp, host: str, port: int):
         refresh_token_ttl=refresh_token_ttl,
     )
     # OAuth tokens now survive restarts: drop those of clients deleted while
-    # the server was down (or via ``beaconmcp auth revoke``). Skipped when no
-    # client loaded at all, so an unreadable clients.json can't wipe the db.
+    # the server was down. Skipped when no client loaded at all, so an
+    # unreadable clients.json can't wipe the db.
     known_clients = {c["client_id"] for c in client_store.list_clients()}
     if known_clients:
         token_store.prune_unknown_clients(known_clients)
+    # ...and of clients deleted while it is up: ``beaconmcp auth revoke``
+    # rewrites clients.json from another process, the store notices at the
+    # next lookup and hands us the survivors.
+    client_store.on_clients_removed = token_store.prune_unknown_clients
     code_store = CodeStore()
 
     # Shared dashboard SQLite handle. Three features live in it -- sessions,
@@ -2038,6 +2042,11 @@ def _run_http(mcp, host: str, port: int):
 
         bearer = authorization[7:]
         client_id = token_store.validate(bearer)
+        # A bearer of a client revoked from the CLI dies with the client:
+        # ``exists`` re-reads clients.json when it changed on disk, which
+        # also prunes the client's tokens via ``on_clients_removed``.
+        if client_id and not client_store.exists(client_id):
+            client_id = None
         if not client_id:
             return JSONResponse(
                 _build_unauthorized_body(request.headers, error="invalid_token"),

@@ -337,6 +337,31 @@ def _fetch_transport() -> httpx.AsyncBaseTransport:
     return transport
 
 
+async def _remove_quietly(ssh_client: Any, host: str, path: str) -> None:
+    """Best-effort cleanup that also runs when the caller is being cancelled
+    (a restart cancels in-flight requests after a few seconds)."""
+    try:
+        await asyncio.shield(ssh_client.sftp_remove(host, path))
+    except (Exception, asyncio.CancelledError):
+        pass
+
+
+def _checksum_from(sum_res: dict[str, Any]) -> tuple[str | None, str | None]:
+    """``(sha, error)`` from a ``sha256sum <dest>`` run in the guest.
+
+    Only a missing ``sha256sum`` (exit 127) or no output counts as "can't
+    verify". Any other failure (a directory, no permission, a wrong path)
+    means the file is not where the caller asked, so it is an error.
+    """
+    code = sum_res.get("exit_code")
+    if code == 0 and sum_res.get("stdout"):
+        return sum_res["stdout"].split()[0], None
+    if code in (0, 127):
+        return None, None
+    detail = (sum_res.get("stderr") or sum_res.get("error") or f"exit {code}").strip()
+    return None, f"Checksum check of the pushed file failed: {detail}"
+
+
 async def _push_staged(
     client: ProxmoxClient,
     ssh_client: Any,
@@ -367,15 +392,19 @@ async def _push_staged(
     if vm_type == "lxc":
         node_tmp = f"/tmp/beaconmcp-upload-{uuid.uuid4().hex[:12]}"
         try:
-            await ssh_client.sftp_put(node, str(local_path), node_tmp)
-        except Exception as e:
-            return {"status": "error", "error": f"SFTP to node {node!r} failed: {e}"}
-        push_res = await ssh_client.exec_command(
-            node,
-            f"pct push {vmid} {shlex.quote(node_tmp)} {shlex.quote(dest)}",
-            timeout=600,
-        )
-        await ssh_client.sftp_remove(node, node_tmp)
+            try:
+                await ssh_client.sftp_put(node, str(local_path), node_tmp)
+            except Exception as e:
+                return {"status": "error", "error": f"SFTP to node {node!r} failed: {e}"}
+            push_res = await ssh_client.exec_command(
+                node,
+                f"pct push {vmid} {shlex.quote(node_tmp)} {shlex.quote(dest)}",
+                timeout=600,
+            )
+        finally:
+            # Also after a partial SFTP (full /tmp) or a cancelled request:
+            # the node's /tmp must not keep the copy.
+            await _remove_quietly(ssh_client, node, node_tmp)
         if push_res.get("exit_code") != 0:
             return {
                 "status": "error",
@@ -388,8 +417,9 @@ async def _push_staged(
                 f"pct exec {vmid} -- sha256sum {shlex.quote(dest)}",
                 timeout=300,
             )
-            if sum_res.get("exit_code") == 0 and sum_res.get("stdout"):
-                remote_sha = sum_res["stdout"].split()[0]
+            remote_sha, sum_err = _checksum_from(sum_res)
+            if sum_err:
+                return {"status": "error", "error": sum_err, "bytes": size_bytes}
             if remote_sha and remote_sha != local_sha:
                 return {
                     "status": "error",
@@ -421,6 +451,16 @@ async def _push_staged(
                 "or use proxmox_write_file for files ≤1MB."
             ),
         }
+    # SFTP put into an existing directory would drop the file inside it
+    # under the staging name (upload-<id>), not at `dest`.
+    dir_check = await ssh_client.exec_command(
+        str(vmid), f"test -d {shlex.quote(dest)}", timeout=30,
+    )
+    if dir_check.get("exit_code") == 0:
+        return {
+            "status": "error",
+            "error": f"`dest` {dest!r} is a directory in VM {vmid}: give the full file path.",
+        }
     try:
         await ssh_client.sftp_put(str(vmid), str(local_path), dest)
     except Exception as e:
@@ -430,8 +470,9 @@ async def _push_staged(
         sum_res = await ssh_client.exec_command(
             str(vmid), f"sha256sum {shlex.quote(dest)}", timeout=300,
         )
-        if sum_res.get("exit_code") == 0 and sum_res.get("stdout"):
-            remote_sha = sum_res["stdout"].split()[0]
+        remote_sha, sum_err = _checksum_from(sum_res)
+        if sum_err:
+            return {"status": "error", "error": sum_err, "bytes": size_bytes}
         if remote_sha and remote_sha != local_sha:
             return {
                 "status": "error",

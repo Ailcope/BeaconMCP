@@ -28,6 +28,7 @@ from beaconmcp.proxmox import system  # noqa: E402
 NODE = "pve1"
 CT = 201
 STOPPED_CT = 202
+VM = 300  # a QEMU VM reached over SSH
 
 
 class FakeMCP:
@@ -56,18 +57,32 @@ class FakeProxmox:
         for vmid in (CT, STOPPED_CT):
             if path == f"nodes/{node}/lxc/{vmid}/status/current":
                 return {"status": "stopped" if vmid in self.stopped else "running"}
+        if path == f"nodes/{node}/qemu/{VM}/status/current":
+            return {"status": "running"}
         return {"error": "not found"}
 
 
 class FakeSSH:
-    """Records node uploads and ``pct push`` targets."""
+    """Records node uploads and ``pct push`` targets, and SFTP into ``VM``."""
 
     def __init__(self) -> None:
         self.node_files: dict[str, bytes] = {}
         self.guest_files: dict[str, bytes] = {}
+        self.vm_files: dict[str, bytes] = {}
+        self.vm_dirs: set[str] = {"/opt/app"}
+        self.sha256sum_exit: int | None = None  # force a sha256sum exit code
+
+    def resolve(self, host: str) -> str:
+        if host != str(VM):
+            raise KeyError(host)
+        return "192.0.2.30"
 
     async def sftp_put(self, host: str, local_path: str, remote_path: str) -> None:
-        self.node_files[remote_path] = Path(local_path).read_bytes()
+        data = Path(local_path).read_bytes()
+        if host == str(VM):
+            self.vm_files[remote_path] = data
+        else:
+            self.node_files[remote_path] = data
 
     async def sftp_remove(self, host: str, remote_path: str) -> None:
         self.node_files.pop(remote_path, None)
@@ -78,8 +93,15 @@ class FakeSSH:
             self.guest_files[argv[4]] = self.node_files[argv[3]]
             return {"exit_code": 0, "stdout": "", "stderr": ""}
         if argv[:2] == ["pct", "exec"] and argv[4] == "sha256sum":
+            if self.sha256sum_exit is not None:
+                return {"exit_code": self.sha256sum_exit, "stdout": "", "stderr": "sha256sum: failed"}
             data = self.guest_files[argv[5]]
             return {"exit_code": 0, "stdout": f"{hashlib.sha256(data).hexdigest()}  {argv[5]}\n"}
+        if host == str(VM) and argv[:2] == ["test", "-d"]:
+            return {"exit_code": 0 if argv[2] in self.vm_dirs else 1, "stdout": ""}
+        if host == str(VM) and argv[0] == "sha256sum":
+            data = self.vm_files[argv[1]]
+            return {"exit_code": 0, "stdout": f"{hashlib.sha256(data).hexdigest()}  {argv[1]}\n"}
         return {"exit_code": 1, "stderr": f"unexpected command: {command}"}
 
 
@@ -235,6 +257,88 @@ async def test_failed_push_is_500_not_502(env, monkeypatch: pytest.MonkeyPatch) 
     resp = await env.http.put(link["url"], content=b"data")
     assert resp.status_code == 500
     assert "no such directory" in resp.json()["error"]
+
+
+async def test_node_copy_is_removed_after_a_failed_sftp(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def partial_put(host: str, local_path: str, remote_path: str) -> None:
+        env.ssh.node_files[remote_path] = b"partial"
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(env.ssh, "sftp_put", partial_put)
+    link = await _mint(env)
+    resp = await env.http.put(link["url"], content=b"data")
+    assert resp.status_code == 500
+    assert env.ssh.node_files == {}
+
+
+async def test_cancelled_upload_cleans_up_and_settles_the_link(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A restart cancels in-flight requests (uvicorn's graceful-shutdown cap).
+    import asyncio
+
+    started = asyncio.Event()
+
+    async def hanging_exec(host: str, command: str, timeout: int = 60) -> dict[str, Any]:
+        started.set()
+        await asyncio.sleep(3600)
+        return {}
+
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(transfers.audit, "emit", lambda event, **kw: events.append({"event": event, **kw}))
+    monkeypatch.setattr(env.ssh, "exec_command", hanging_exec)
+    link = await _mint(env)
+    task = asyncio.create_task(env.http.put(link["url"], content=b"data"))
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)  # let the shielded cleanup run
+
+    assert env.ssh.node_files == {}
+    assert list(env.staging.iterdir()) == []
+    status = await env.tools["proxmox_upload_link"](link_id=link["link_id"])
+    assert status["status"] == "error"
+    assert [e["event"] for e in events] == ["transfer.upload"]
+
+
+@pytest.mark.parametrize("code, ok", [(127, True), (1, False)])
+async def test_checksum_failure_is_not_reported_as_unverified_success(env, code: int, ok: bool) -> None:
+    env.ssh.sha256sum_exit = code
+    link = await _mint(env)
+    resp = await env.http.put(link["url"], content=b"data")
+    body = resp.json()
+    if ok:  # sha256sum missing: success, flagged as unverified
+        assert body["status"] == "success" and body["checksum_verified"] is False
+    else:  # anything else: the file is not where asked
+        assert body["status"] == "error" and "Checksum check" in body["error"]
+
+
+async def test_qemu_push_lands_at_dest(env) -> None:
+    link = await _mint(env, vmid=VM, dest="/opt/app/tool.bin")
+    resp = await env.http.put(link["url"], content=b"bin")
+    assert resp.json()["status"] == "success", resp.json()
+    assert env.ssh.vm_files == {"/opt/app/tool.bin": b"bin"}
+
+
+async def test_qemu_push_refuses_a_directory_dest(env) -> None:
+    link = await _mint(env, vmid=VM, dest="/opt/app")
+    resp = await env.http.put(link["url"], content=b"bin")
+    assert resp.json()["status"] == "error"
+    assert "directory" in resp.json()["error"]
+    assert env.ssh.vm_files == {}
+
+
+async def test_loopback_request_base_is_not_used_for_links(tmp_path: Path) -> None:
+    # The dashboard chat reaches the MCP endpoint over 127.0.0.1.
+    mcp = FakeMCP()
+    system.register_system_tools(mcp, FakeProxmox(tmp_path, public_url=None), FakeSSH())
+    var = transfers.current_public_base.set("http://127.0.0.1:8420")
+    try:
+        res = await mcp.tools["proxmox_upload_link"](node=NODE, vmid=CT, dest="/x")
+    finally:
+        transfers.current_public_base.reset(var)
+        transfers.register_pusher(None)
+    assert res["url"].startswith(transfers.UPLOAD_PATH_PREFIX)
+    assert "warning" in res
 
 
 async def test_unknown_token_is_404(env) -> None:

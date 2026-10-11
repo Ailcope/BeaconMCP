@@ -41,8 +41,11 @@ class FakePVE:
         if path == f"nodes/{node}/qemu/{VM}/status/current":
             return {"status": "running"}
         if path == f"nodes/{node}/qemu/{VM}/agent/file-read":
-            if "decode" in params and not self.has_decode_param:
-                return {"error": "400 Parameter verification failed: decode: property is not defined in schema"}
+            if not self.has_decode_param:
+                # Older qemu-server: neither `decode` nor `count` in the schema.
+                for name in ("decode", "count"):
+                    if name in params:
+                        return {"error": f"400 Parameter verification failed: {name}: property is not defined in schema"}
             data = self.files[params["file"]][: params.get("count", 16 * 1024 * 1024)]
             if params.get("decode", 1):
                 # Perl hands JSON the decoded bytes, one code point each.

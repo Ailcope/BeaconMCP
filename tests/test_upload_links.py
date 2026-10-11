@@ -544,3 +544,26 @@ async def test_guarded_connect_keeps_the_hostname(
     )
     assert res["status"] == "success", res
     assert env.ssh.guest_files["/f"] == f"LOOPBACK-ONLY-SECRET files.test:{loopback_server}".encode()
+
+
+async def test_fetch_tries_each_checked_address(monkeypatch) -> None:
+    # An unreachable first answer (an AAAA on an IPv4-only box) must not end
+    # the fetch: every address was checked, so the next one is still safe.
+    import httpcore
+
+    async def fake_dns(host):
+        return ["2001:db8::1", "198.51.100.7"]
+
+    monkeypatch.setattr(system, "_host_addresses", fake_dns)
+    backend = system._GuardedNetworkBackend()
+    tried: list[str] = []
+
+    async def connect(addr, port, **kw):
+        tried.append(addr)
+        if addr == "2001:db8::1":
+            raise httpcore.ConnectError("network unreachable")
+        return "stream"
+
+    monkeypatch.setattr(backend._inner, "connect_tcp", connect)
+    assert await backend.connect_tcp("example.com", 443) == "stream"
+    assert tried == ["2001:db8::1", "198.51.100.7"]

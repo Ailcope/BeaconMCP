@@ -10,7 +10,8 @@ from typing import Any
 
 from proxmoxer import ProxmoxAPI
 from requests.adapters import HTTPAdapter
-from requests.exceptions import ConnectionError, Timeout
+from requests.exceptions import ConnectionError, ConnectTimeout, Timeout
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from ..config import Config
 
@@ -98,6 +99,14 @@ def _trust_ca_bundle(conn: ProxmoxAPI, ca_path: str) -> None:
     session.mount("https://", _CABundleAdapter(ca_path))
 
 
+def _never_sent(exc: Exception) -> bool:
+    """True when the TCP connection itself failed, so no request went out."""
+    if isinstance(exc, ConnectTimeout):
+        return True
+    reason = getattr(exc.args[0], "reason", None) if exc.args else None
+    return isinstance(reason, (NewConnectionError, ConnectTimeoutError))
+
+
 class ProxmoxClient:
     """Manages connections to one or more Proxmox VE nodes via API tokens."""
 
@@ -166,6 +175,17 @@ class ProxmoxClient:
                 raise
             except (ConnectionError, Timeout) as e:
                 last_exc = e
+                # A GET is safe to send twice. Anything else is retried only
+                # when the request provably never reached the node: a read
+                # timeout on vm_clone or snapshot_create may mean the task is
+                # already running, and a second POST would start it again.
+                if method != "get" and not _never_sent(e):
+                    self._cache().pop(node_name, None)
+                    return {
+                        "error": f"Node '{node_name}' did not answer in time: {e}. "
+                        "The request may still have been applied; check "
+                        "proxmox_get_tasks before retrying."
+                    }
                 # Drop this thread's cached connection so the retry rebuilds
                 # TLS state rather than re-using a half-broken socket. Other
                 # threads keep their own healthy sessions.

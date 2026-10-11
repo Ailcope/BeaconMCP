@@ -41,14 +41,16 @@ _EXEC_SESSION_TTL = 3600
 
 
 def _prune_exec_sessions() -> None:
+    # Runs on executor threads while other threads add sessions: snapshot the
+    # items first, or the dict can change size under the iteration.
     now = time.time()
     stale = [
         eid
-        for eid, s in _exec_sessions.items()
+        for eid, s in list(_exec_sessions.items())
         if s.status != "running" and now - s.started_at > _EXEC_SESSION_TTL
     ]
     for eid in stale:
-        del _exec_sessions[eid]
+        _exec_sessions.pop(eid, None)
 
 
 def _detect_guest(client: ProxmoxClient, node: str, vmid: int) -> tuple[str, str] | None:

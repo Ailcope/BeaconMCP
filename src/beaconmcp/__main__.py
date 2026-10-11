@@ -1161,14 +1161,26 @@ def _run_http(mcp, host: str, port: int):
         if env_named_ttl and env_named_ttl.isdigit()
         else config.server.named_token_ttl
     )
-    # Refresh-token lifetime: BEACONMCP_REFRESH_TOKEN_TTL env (seconds) >
-    # server.refresh_token_ttl in the YAML > TokenStore default (30 days).
+    # Refresh-token idle lifetime: BEACONMCP_REFRESH_TOKEN_TTL env (seconds) >
+    # server.refresh_token_ttl in the YAML > TokenStore default (24 h). The
+    # env path skips the YAML loader, so it gets the same bounds check here:
+    # no sign-in outlives 24 h, and "0 = never" is gone.
     env_refresh_ttl = os.environ.get("BEACONMCP_REFRESH_TOKEN_TTL")
     refresh_token_ttl = (
         int(env_refresh_ttl)
         if env_refresh_ttl and env_refresh_ttl.isdigit()
         else config.server.refresh_token_ttl
     )
+    if refresh_token_ttl is not None and not (
+        0 < refresh_token_ttl <= TokenStore.SESSION_LIFETIME
+    ):
+        print(
+            "ERROR: BEACONMCP_REFRESH_TOKEN_TTL must be between 1 and "
+            f"{TokenStore.SESSION_LIFETIME} seconds (24 h); a sign-in never "
+            "outlives 24 h and 0 (never expires) is not supported.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     token_store = TokenStore(
         db_path=tokens_db,
         named_token_ttl=named_token_ttl,

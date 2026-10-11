@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .config import MAX_REFRESH_TOKEN_TTL
+
 try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
@@ -152,7 +154,8 @@ class ServerDraft:
     audit_log: str = ""
     # Named-token lifetime in seconds; empty means the 30-day default.
     named_token_ttl: str = ""
-    # OAuth refresh-token lifetime in seconds; empty means the 30-day default.
+    # OAuth refresh-token idle lifetime in seconds; empty means the 24 h
+    # default, which is also the maximum (a sign-in never outlives 24 h).
     refresh_token_ttl: str = ""
 
 
@@ -1250,15 +1253,16 @@ class _ServerPanel(Static):
             placeholder="2592000",
         )
         yield Static(
-            "refresh_token_ttl -- lifetime (seconds) of OAuth refresh tokens "
-            "(claude.ai and other authorization_code clients). Empty = 30 "
-            "days; 0 = never expires. Each refresh restarts the clock.",
+            "refresh_token_ttl -- idle lifetime (seconds) of OAuth refresh "
+            "tokens (claude.ai and other authorization_code clients). Empty = "
+            "24 h, also the maximum: a sign-in never outlives 24 h, so clients "
+            "re-enter their TOTP once a day. 0 (never) is not accepted.",
             classes="field-label",
         )
         yield Input(
             value=srv.refresh_token_ttl,
             id="srv-refresh-ttl",
-            placeholder="2592000",
+            placeholder="86400",
         )
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1280,7 +1284,10 @@ class _ServerPanel(Static):
             srv.named_token_ttl = raw if raw.isdigit() else ""
         elif event.input.id == "srv-refresh-ttl":
             raw = event.value.strip()
-            srv.refresh_token_ttl = raw if raw.isdigit() else ""
+            # Same bounds as the loader: 1..24 h, no "never".
+            srv.refresh_token_ttl = (
+                raw if raw.isdigit() and 0 < int(raw) <= MAX_REFRESH_TOKEN_TTL else ""
+            )
         self.on_change()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:

@@ -227,8 +227,12 @@ class RefreshToken:
     family_id: str
     expires_at: float
     created_at: float
-    # Rotated out. Kept (for a bounded time, see
-    # ``TokenStore.USED_REFRESH_RETENTION``) so a replay can be recognised
+    # Absolute end of the sign-in this token belongs to: the
+    # ``authorization_code`` exchange plus ``TokenStore.SESSION_LIFETIME``.
+    # Shared by every token of the family and never pushed back by a
+    # refresh, so a connector goes back through TOTP once a day.
+    family_expires_at: float
+    # Rotated out. Kept until the family ends so a replay can be recognised
     # as reuse (and the family revoked) instead of a plain unknown token.
     used: bool = False
     # When it was rotated out, and the pair that rotation minted. Memory
@@ -661,16 +665,18 @@ class TokenStore:
     # into an external client -- 30 days is the sensible default. Overridable
     # per-deployment via ``named_token_ttl`` (server.named_token_ttl / env).
     NAMED_TOKEN_TTL = 3600 * 24 * 30  # 30 days
-    # Default lifetime of an OAuth refresh token. Every refresh rotates it
-    # and restarts the clock, so a client in regular use never has to
-    # re-authenticate. Overridable via ``refresh_token_ttl``
-    # (server.refresh_token_ttl / env); ``0`` means never expires.
-    REFRESH_TOKEN_TTL = 3600 * 24 * 30  # 30 days
-    # How long a rotated-out refresh token is kept for reuse detection. It
-    # can't mint anything any more, so it doesn't need its full lifetime;
-    # this also bounds the table (and memory) when ``refresh_token_ttl`` is
-    # 0, where rows would otherwise never expire -- one per refresh, forever.
-    USED_REFRESH_RETENTION = 3600 * 24 * 30  # 30 days
+    # Absolute lifetime of an OAuth sign-in (``authorization_code`` grant).
+    # Every access and refresh token of a family expires at the exchange
+    # time plus this, whatever ``refresh_token_ttl`` says: a refresh can
+    # carry the client up to that point but never past it, so a connector
+    # goes back through the TOTP page once a day. This server can run shell
+    # on the hypervisors; a sign-in that never ends is not an option.
+    SESSION_LIFETIME = 3600 * 24  # 24 hours
+    # Idle lifetime of an OAuth refresh token: a refresh rotates it and
+    # restarts this clock, within the session lifetime above. Overridable
+    # via ``refresh_token_ttl`` (server.refresh_token_ttl / env), capped at
+    # ``SESSION_LIFETIME``; ``0`` (never expires) is not accepted.
+    REFRESH_TOKEN_TTL = SESSION_LIFETIME
     # A refresh token presented again this soon after it was rotated out
     # is treated as a retry of the same call (client timed out, resent)
     # and gets the pair the first call minted, instead of being counted as
@@ -706,11 +712,14 @@ class TokenStore:
         self.named_token_ttl = (
             named_token_ttl if named_token_ttl is not None else self.NAMED_TOKEN_TTL
         )
-        self.refresh_token_ttl = (
-            refresh_token_ttl
-            if refresh_token_ttl is not None
-            else self.REFRESH_TOKEN_TTL
-        )
+        if refresh_token_ttl is None:
+            refresh_token_ttl = self.REFRESH_TOKEN_TTL
+        if not 0 < refresh_token_ttl <= self.SESSION_LIFETIME:
+            raise ValueError(
+                "refresh_token_ttl must be between 1 and "
+                f"{self.SESSION_LIFETIME} seconds (a sign-in never outlives 24 h)"
+            )
+        self.refresh_token_ttl = refresh_token_ttl
         if db_path is not None:
             self._init_db(Path(db_path))
 
@@ -749,20 +758,13 @@ class TokenStore:
                 " family_id TEXT NOT NULL,"
                 " expires_at REAL NOT NULL,"
                 " created_at REAL NOT NULL,"
-                " used INTEGER NOT NULL DEFAULT 0)"
+                " used INTEGER NOT NULL DEFAULT 0,"
+                " family_expires_at REAL)"
             )
             conn.commit()
             self._db = conn
             now = time.time()
-            # Rotated-out rows written before the retention cap existed
-            # kept the token's own expiry (``inf`` with refresh_token_ttl 0):
-            # bound them too, counting from their creation since the
-            # rotation time was not recorded.
-            conn.execute(
-                "UPDATE refresh_tokens SET expires_at = MIN(expires_at, created_at + ?) "
-                "WHERE used = 1",
-                (self.USED_REFRESH_RETENTION,),
-            )
+            self._bound_legacy_sessions(conn)
             for row in conn.execute(
                 "SELECT token, client_id, name, expires_at, created_at "
                 "FROM named_tokens WHERE expires_at > ?",
@@ -782,13 +784,14 @@ class TokenStore:
                     created_at=row[4], family_id=row[2],
                 )
             for row in conn.execute(
-                "SELECT token_hash, client_id, family_id, expires_at, created_at, used "
-                "FROM refresh_tokens WHERE expires_at > ?",
+                "SELECT token_hash, client_id, family_id, expires_at, created_at, used, "
+                "family_expires_at FROM refresh_tokens WHERE expires_at > ?",
                 (now,),
             ).fetchall():
                 self._refresh_tokens[row[0]] = RefreshToken(
                     token_hash=row[0], client_id=row[1], family_id=row[2],
-                    expires_at=row[3], created_at=row[4], used=bool(row[5]),
+                    expires_at=row[3], created_at=row[4], family_expires_at=row[6],
+                    used=bool(row[5]),
                 )
             # Drop rows that expired while the process was down.
             conn.execute("DELETE FROM named_tokens WHERE expires_at <= ?", (now,))
@@ -798,6 +801,36 @@ class TokenStore:
         except Exception:  # noqa: BLE001 -- persistence must never block startup
             _logger.exception("token persistence disabled (db init failed)")
             self._db = None
+
+    def _bound_legacy_sessions(self, conn: sqlite3.Connection) -> None:
+        """Give rows written before ``family_expires_at`` existed a session end.
+
+        Those builds let a family live as long as it kept refreshing. Each
+        family is bounded from its first token (the rotated-out rows are
+        kept, so that row is still there), and every access or refresh
+        token of the family is capped at that end.
+        """
+        try:
+            conn.execute("ALTER TABLE refresh_tokens ADD COLUMN family_expires_at REAL")
+        except sqlite3.OperationalError:
+            pass  # column already there
+        conn.execute(
+            "UPDATE refresh_tokens SET family_expires_at = ? + ("
+            " SELECT MIN(created_at) FROM refresh_tokens AS first"
+            " WHERE first.family_id = refresh_tokens.family_id)"
+            " WHERE family_expires_at IS NULL",
+            (self.SESSION_LIFETIME,),
+        )
+        conn.execute(
+            "UPDATE refresh_tokens SET expires_at = MIN(expires_at, family_expires_at)"
+        )
+        conn.execute(
+            "UPDATE oauth_tokens SET expires_at = MIN(expires_at, COALESCE("
+            " (SELECT MIN(family_expires_at) FROM refresh_tokens"
+            "  WHERE refresh_tokens.family_id = oauth_tokens.family_id), expires_at))"
+            " WHERE family_id IS NOT NULL"
+        )
+        conn.commit()
 
     def _persist(self, at: AccessToken) -> None:
         if self._db is None or at.name is None:
@@ -846,10 +879,10 @@ class TokenStore:
     def _persist_refresh(self, rt: RefreshToken) -> None:
         self._db_write(
             "INSERT OR REPLACE INTO refresh_tokens "
-            "(token_hash, client_id, family_id, expires_at, created_at, used) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(token_hash, client_id, family_id, expires_at, created_at, used, "
+            "family_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (rt.token_hash, rt.client_id, rt.family_id, rt.expires_at,
-             rt.created_at, int(rt.used)),
+             rt.created_at, int(rt.used), rt.family_expires_at),
         )
 
     def issue(
@@ -891,16 +924,21 @@ class TokenStore:
     # --- OAuth grants --------------------------------------------------------
 
     def _mint_oauth(
-        self, client_id: str, family_id: str | None,
+        self, client_id: str, family_id: str | None, family_expires_at: float,
     ) -> OAuthGrant:
         """Mint a persisted OAuth bearer, plus a refresh token when
-        ``family_id`` is given. Caller holds the lock."""
+        ``family_id`` is given. Neither outlives ``family_expires_at``, the
+        absolute end of the sign-in. Caller holds the lock."""
         now = time.time()
         access = secrets.token_hex(32)
+        access_expires_at = min(now + self.TOKEN_TTL, family_expires_at)
+        # ``round``, not ``int``: the family end was stamped a few µs before
+        # ``now`` on a fresh sign-in, and 86399.9999 must read as 24 h.
+        expires_in = min(self.TOKEN_TTL, max(0, round(family_expires_at - now)))
         at = AccessToken(
             token=_hash_secret(access),
             client_id=client_id,
-            expires_at=now + self.TOKEN_TTL,
+            expires_at=access_expires_at,
             created_at=now,
             family_id=family_id,
         )
@@ -909,29 +947,32 @@ class TokenStore:
         refresh: str | None = None
         if family_id is not None:
             refresh = secrets.token_hex(32)
-            ttl = self.refresh_token_ttl
             rt = RefreshToken(
                 token_hash=_hash_secret(refresh),
                 client_id=client_id,
                 family_id=family_id,
-                expires_at=float("inf") if ttl == 0 else now + ttl,
+                expires_at=min(now + self.refresh_token_ttl, family_expires_at),
                 created_at=now,
+                family_expires_at=family_expires_at,
             )
             self._refresh_tokens[rt.token_hash] = rt
             self._persist_refresh(rt)
         return OAuthGrant(
-            access_token=access, expires_in=self.TOKEN_TTL, refresh_token=refresh,
+            access_token=access, expires_in=expires_in, refresh_token=refresh,
         )
 
     def issue_oauth(self, client_id: str, *, refresh: bool = False) -> OAuthGrant:
         """Issue a persisted OAuth access token for ``client_id``.
 
         With ``refresh=True`` (``authorization_code`` grant) a refresh token
-        opening a new rotation family is issued alongside it.
+        opening a new rotation family is issued alongside it. The family,
+        and every token it will ever mint, ends ``SESSION_LIFETIME`` from now.
         """
         with self._lock:
             family_id = secrets.token_hex(16) if refresh else None
-            grant = self._mint_oauth(client_id, family_id)
+            grant = self._mint_oauth(
+                client_id, family_id, time.time() + self.SESSION_LIFETIME,
+            )
             self._cleanup()
             return grant
 
@@ -941,15 +982,23 @@ class TokenStore:
         The presented token is rotated out. Replaying a rotated-out token
         revokes its whole family (OAuth 2.1 / RFC 9700 reuse detection):
         either the legitimate client or an attacker holds a stolen copy,
-        and there is no telling which. Raises :class:`RefreshTokenError`.
+        and there is no telling which. The new pair stops at the family's
+        ``family_expires_at``, however recent the rotation: once the sign-in
+        is 24 h old the client goes back through ``/oauth/authorize``.
+        Raises :class:`RefreshTokenError`.
         """
         with self._lock:
             now = time.time()
             rt = self._refresh_tokens.get(_hash_secret(refresh_token))
             if rt is None or rt.client_id != client_id:
                 raise RefreshTokenError("invalid")
-            if now > rt.expires_at:
-                self._drop_refresh(rt.token_hash)
+            if now > rt.expires_at or now >= rt.family_expires_at:
+                # The whole sign-in is over with the family end; a token
+                # that idled past its own TTL only takes itself out.
+                if now >= rt.family_expires_at:
+                    self.revoke_family(rt.family_id)
+                else:
+                    self._drop_refresh(rt.token_hash)
                 raise RefreshTokenError("expired", family_id=rt.family_id)
             if rt.used:
                 if (
@@ -961,10 +1010,8 @@ class TokenStore:
                 raise RefreshTokenError("reused", family_id=rt.family_id)
             rt.used = True
             rt.used_at = now
-            # Kept for reuse detection only from here on: bound its stay.
-            rt.expires_at = min(rt.expires_at, now + self.USED_REFRESH_RETENTION)
             self._persist_refresh(rt)
-            grant = self._mint_oauth(client_id, rt.family_id)
+            grant = self._mint_oauth(client_id, rt.family_id, rt.family_expires_at)
             rt.replay = grant
             self._cleanup()
             return grant

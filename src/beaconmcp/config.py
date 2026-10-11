@@ -27,6 +27,12 @@ import yaml
 
 _logger = logging.getLogger("beaconmcp.config")
 
+# Upper bound for ``server.refresh_token_ttl``: an OAuth sign-in never
+# outlives 24 h (``auth.TokenStore.SESSION_LIFETIME``), so a longer refresh
+# token would be a lie. Kept here, not imported, so the loader stays free of
+# the auth module.
+MAX_REFRESH_TOKEN_TTL = 3600 * 24
+
 
 # --- Dataclasses -----------------------------------------------------------
 
@@ -156,11 +162,12 @@ class ServerConfig:
     # session bearers always use the fixed 24 h TTL. The
     # BEACONMCP_NAMED_TOKEN_TTL env var overrides this.
     named_token_ttl: int | None = None
-    # Lifetime, in seconds, of OAuth refresh tokens (``authorization_code``
+    # Idle lifetime, in seconds, of OAuth refresh tokens (``authorization_code``
     # clients such as claude.ai). Each refresh rotates the token and restarts
-    # the clock. ``None`` means the ``auth.TokenStore`` default (30 days);
-    # ``0`` means never expires. The BEACONMCP_REFRESH_TOKEN_TTL env var
-    # overrides this.
+    # this clock, but no sign-in outlives 24 h (``auth.TokenStore.
+    # SESSION_LIFETIME``), so the value is capped there. ``None`` means the
+    # default (24 h); ``0`` (never expires) is rejected. The
+    # BEACONMCP_REFRESH_TOKEN_TTL env var overrides this.
     refresh_token_ttl: int | None = None
 
 
@@ -573,10 +580,13 @@ class Config:
                 "server.named_token_ttl: must be >= 0 seconds "
                 "(0 = named tokens never expire, revoke-only)."
             )
-        if server.refresh_token_ttl is not None and server.refresh_token_ttl < 0:
+        if server.refresh_token_ttl is not None and not (
+            0 < server.refresh_token_ttl <= MAX_REFRESH_TOKEN_TTL
+        ):
             raise ConfigError(
-                "server.refresh_token_ttl: must be >= 0 seconds "
-                "(0 = refresh tokens never expire)."
+                "server.refresh_token_ttl: must be between 1 and "
+                f"{MAX_REFRESH_TOKEN_TTL} seconds (24 h). A sign-in never outlives "
+                "24 h; 0 (never expires) is not supported."
             )
 
         feat_raw = raw.get("features") or {}
@@ -734,13 +744,9 @@ class Config:
                     )
                 ),
                 "refresh_token_ttl": (
-                    "(default: 30 days)"
+                    "(default: 24 h)"
                     if self.server.refresh_token_ttl is None
-                    else (
-                        "0 (never expires)"
-                        if self.server.refresh_token_ttl == 0
-                        else self.server.refresh_token_ttl
-                    )
+                    else self.server.refresh_token_ttl
                 ),
             },
             "proxmox": {

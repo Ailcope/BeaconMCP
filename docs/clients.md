@@ -100,7 +100,7 @@ phone; the derived client has no TOTP seed of its own.
    - **Authentication:** OAuth.
 4. ChatGPT fetches the OAuth metadata, POSTs to the slug-gated `/oauth/register/c/<slug>` — BeaconMCP consumes the slug atomically and mints a derived client scoped to your account.
 5. ChatGPT then redirects you to BeaconMCP's authorization page. Type your TOTP from your phone. Access token lifetime: 24 h.
-6. From now on, ChatGPT renews its access token with the refresh token it received, without prompting you. You only sign in again if the refresh token goes unused for `server.refresh_token_ttl` (30 days by default) or gets revoked.
+6. From now on, ChatGPT renews its access token with the refresh token it received, without prompting you, for the rest of the day: a sign-in never outlives 24 h, so you type your TOTP again once a day (or earlier if the client is revoked, or if the refresh token goes unused for `server.refresh_token_ttl`).
 
 **Revocation:** `https://<your-host>/app/connectors` lists every active derived client. Revoke one and ChatGPT loses access immediately. Revoking your human account cascades to every derived client automatically.
 
@@ -343,7 +343,8 @@ the bare `/mcp` URL and it handles the rest.
 3. Validate. Le Chat discovers the OAuth metadata and redirects you to
    BeaconMCP's authorization page — type your TOTP from your phone.
    Access token lifetime: 24 h; Le Chat renews it with its refresh
-   token on its own.
+   token on its own until the sign-in is 24 h old, then asks for your
+   TOTP again (once a day).
 
 Custom connectors are on Le Chat Pro / Enterprise; the free tier may
 hide the panel.

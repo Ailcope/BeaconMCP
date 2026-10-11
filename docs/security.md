@@ -54,9 +54,14 @@ its TOTP-on-every-exchange rule). Each refresh rotates the token; replaying an a
 token revokes every access and refresh token of that sign-in (`auth.token.refresh.reuse` in the
 audit log), and the client has to go through the authorization page again. The one exception is a
 replay within 60 s of the rotation, which is read as the same client retrying after a network
-timeout and gets the pair the first call minted. Rotated-out tokens are kept for 30 days at most
-for that detection, even with `refresh_token_ttl: 0`. Deleting a client, or calling
+timeout and gets the pair the first call minted. Deleting a client, or calling
 `security_end_session`, drops its refresh tokens too.
+
+**A sign-in never outlives 24 h.** Every access and refresh token of a sign-in expires 24 h after
+the `authorization_code` exchange, whatever `server.refresh_token_ttl` says (it is capped at 24 h and
+`0` is refused): a refresh can carry a connector up to that point but never past it, so claude.ai,
+ChatGPT or Le Chat ask for your TOTP once a day. Refresh tokens persist across restarts within that
+day only, and rotated-out tokens disappear with the sign-in they belonged to.
 
 `beaconmcp auth revoke` takes effect immediately, server running or not: the server re-reads
 `clients.json` when it changes on disk, and the revoked client's bearers, refresh tokens and named

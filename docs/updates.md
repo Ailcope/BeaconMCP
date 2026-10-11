@@ -36,7 +36,7 @@ Detection is not a guess about how you *should* have installed it:
 
 | Detected | What you are told |
 |----------|-------------------|
-| git checkout | `cd <root>` → `git pull --ff-only` (release channel: `git fetch --tags origin` → `git merge --ff-only <tag>`) → `<venv>/bin/pip install -e . -c constraints.txt` (the real venv path, when there is one) → `systemctl restart beaconmcp` if a unit file exists |
+| git checkout | `cd <root>` → `git pull --ff-only` (release channel: `git fetch --tags origin` → `git merge --ff-only <tag>`; the tool itself mirrors the tags into `refs/beaconmcp/tags/`, so a re-pointed upstream tag never blocks it) → `<venv>/bin/pip install -e . -c constraints.txt` (the real venv path, when there is one) → `systemctl restart beaconmcp` if a unit file exists |
 | container | `docker compose pull` → `docker compose up -d` |
 | pip distribution | `pip install --upgrade 'beaconmcp @ git+https://github.com/Showdown76py/BeaconMCP.git'` |
 | unknown | Re-run `deploy/install.sh` from a checkout |
@@ -79,6 +79,8 @@ In order, stopping at the first failure:
    *actual* configuration, imports every module, builds the HTTP app and answers `/health`, against
    scratch copies of the token store and dashboard database.
 7. **Restart**: `systemctl restart`, deferred a few seconds so the response reaches you first.
+   Only when the server actually runs under the unit: a `beaconmcp serve` started by hand is told
+   to restart itself instead.
 
 Step 6 is a hard gate before the restart. If the new revision cannot start with your config (a
 setting was renamed, a new one is required, an import is broken) the checkout is reset to exactly
@@ -92,7 +94,9 @@ breaks at runtime). So the restart itself is done by a watchdog, started as its 
 with `systemd-run` (a plain child would be killed with the service's cgroup). It:
 
 1. restarts the service;
-2. waits up to 90 seconds for `/health` to answer, and to still answer 10 seconds later;
+2. waits up to 90 seconds for `/health` to answer, then requires it to keep answering for 30
+   seconds with the same main PID and restart count (a process that crashes and is restarted by
+   systemd every few seconds can answer every single probe);
 3. otherwise runs `git reset --hard <previous revision>`, reinstalls the previous pinned
    dependencies and restarts again.
 
@@ -126,8 +130,13 @@ features:
 - `require_signed: true` makes `git verify-tag` (release) or `git verify-commit` (branch) a hard
   gate. Git checks the signature against the keys the service user trusts: import the maintainers'
   GPG keys, or for SSH signatures set `gpg.ssh.allowedSignersFile` in that user's git config.
+  **Every** public key in that user's keyring is accepted, trusted or not, so keep it to the
+  maintainers' keys (or point `GNUPGHOME` at a dedicated keyring in the unit). A release tag must
+  also carry its own name: a signed `v2.1.0-rc1` republished as `v2.1.0` is refused.
   On the branch channel this needs a signed tip commit; merges made through GitHub's web UI are
-  signed by GitHub's key, which you then have to trust.
+  signed by GitHub's key, which you then have to trust. That key signs every web-UI commit of every
+  GitHub user, so on the branch channel the gate only proves the commit went through github.com:
+  it does not stop anyone who can push or merge to the branch.
 
 Only one update runs at a time. The dashboard button and the MCP tool reach the same code, and two
 `git pull` / `pip install` runs in one checkout would fight over `index.lock`. A second caller is

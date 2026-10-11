@@ -17,6 +17,7 @@ minutes. Links live in memory only: a restart voids every pending link.
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 import threading
 import time
@@ -25,6 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -185,9 +187,28 @@ def register_pusher(pusher: Pusher | None) -> None:
 
 
 def public_base_url(configured: str | None) -> str | None:
-    """Base URL for upload links: the configured public URL, else the request's."""
-    base = (configured or "").strip() or current_public_base.get()
-    return base.rstrip("/") if base else None
+    """Base URL for upload links: the configured public URL, else the request's.
+
+    A loopback request base (the dashboard chat's own MCP session runs over
+    127.0.0.1) is no use to whoever uploads, so it counts as unknown.
+    """
+    configured = (configured or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    base = current_public_base.get()
+    if not base or _is_loopback_url(base):
+        return None
+    return base.rstrip("/")
+
+
+def _is_loopback_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def staged_name(link: UploadLink) -> str:
@@ -211,18 +232,23 @@ def make_upload_endpoint(trusted_proxies: tuple[str, ...] = ()):
                 },
                 status_code=404,
             )
-        result, status_code = await _receive_and_push(request, link)
-        _store.finish(link, result)
-        audit.emit(
-            "transfer.upload",
-            link_id=link.link_id,
-            node=link.node,
-            vmid=link.vmid,
-            dest=link.dest,
-            status=result.get("status"),
-            bytes=result.get("bytes"),
-            ip=client_ip(request, trusted_proxies),
-        )
+        # The link is spent: settle it and audit it whatever happens, a
+        # request cancelled by a restart included.
+        result, status_code = _error("Upload interrupted (server shutting down)."), 500
+        try:
+            result, status_code = await _receive_and_push(request, link)
+        finally:
+            _store.finish(link, result)
+            audit.emit(
+                "transfer.upload",
+                link_id=link.link_id,
+                node=link.node,
+                vmid=link.vmid,
+                dest=link.dest,
+                status=result.get("status"),
+                bytes=result.get("bytes"),
+                ip=client_ip(request, trusted_proxies),
+            )
         return JSONResponse(result, status_code=status_code)
 
     return upload_endpoint
@@ -272,4 +298,17 @@ async def _receive_and_push(request: Request, link: UploadLink) -> tuple[dict[st
 
     result.setdefault("bytes", received)
     result["link_id"] = link.link_id
-    return result, 200 if result.get("status") == "success" else 502
+    return result, _status_code(result)
+
+
+def _status_code(result: dict[str, Any]) -> int:
+    """HTTP status for a finished transfer.
+
+    Not 502: Cloudflare swaps an origin 502 for its own "error code: 502"
+    page, so the uploader would never see why the push failed.
+    """
+    if result.get("status") == "success":
+        return 200
+    if "guest_status" in result:
+        return 409  # target stopped since the link was minted
+    return 500

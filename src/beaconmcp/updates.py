@@ -56,6 +56,8 @@ HEALTH_WAIT_SECONDS = 90
 #: Release tags the release channel follows. Pre-releases (v2.1.0-rc1) are
 #: skipped on purpose.
 _RELEASE_TAG = re.compile(r"^v\d+(?:\.\d+)*$")
+#: Where the release channel keeps its copy of the upstream tags.
+_TAG_NAMESPACE = "refs/beaconmcp/tags/"
 
 #: How long a successful check stays fresh. Updates are not urgent and the
 #: check shells out to git, so once every few hours is plenty.
@@ -70,11 +72,16 @@ _GIT_TIMEOUT = 60
 _PIP_TIMEOUT = 900
 #: ``check-startup`` imports the whole server and builds the HTTP app.
 _STARTUP_CHECK_TIMEOUT = 180
+#: After the first good /health, the new process must keep answering, with
+#: the same PID and restart count, for this long before the update counts as
+#: healthy. The unit restarts a crashed process after 5 s, so two bare
+#: samples a few seconds apart can both land on different incarnations.
+_SETTLE_SECONDS = 30
 #: Longest a post-restart watchdog can still act: two health waits (with
 #: their settle re-check), a pip reinstall and some slack. While the last
 #: status is a ``pending`` younger than this, a new update is refused, so a
 #: watchdog that is still waiting cannot roll back a newer update.
-_WATCHDOG_WINDOW_SECONDS = 2 * (HEALTH_WAIT_SECONDS + 15) + _PIP_TIMEOUT + 60
+_WATCHDOG_WINDOW_SECONDS = 2 * (HEALTH_WAIT_SECONDS + _SETTLE_SECONDS + 15) + _PIP_TIMEOUT + 60
 
 
 @dataclass
@@ -584,10 +591,20 @@ class _Target:
 def _resolve_target(root: Path, channel: str) -> tuple[_Target | None, str | None]:
     """Fetch and name the update target, or explain why there is none."""
     if channel == "release":
-        code, _, err = _git(root, "fetch", "--quiet", "--tags", "origin")
+        # Mirrored into a private namespace, forced and pruned: a plain
+        # `fetch --tags` exits 1 for good once upstream re-points a tag the
+        # checkout already has, and never forgets a deleted one. Forcing is
+        # safe, the ff-only merge and the signature check still gate the move.
+        code, _, err = _git(
+            root, "fetch", "--quiet", "--no-tags", "--prune", "--force", "origin",
+            f"+refs/tags/v*:{_TAG_NAMESPACE}v*",
+        )
         if code != 0:
             return None, f"could not reach the remote ({err or 'git fetch failed'})"
-        code, out, err = _git(root, "tag", "--list", "v*", "--sort=-v:refname")
+        code, out, err = _git(
+            root, "for-each-ref", "--sort=-v:refname", "--format=%(refname:strip=3)",
+            _TAG_NAMESPACE,
+        )
         if code != 0:
             return None, f"could not list release tags ({err or 'git failed'})"
         tags = [t for t in out.splitlines() if _RELEASE_TAG.match(t.strip())]
@@ -597,7 +614,7 @@ def _resolve_target(root: Path, channel: str) -> tuple[_Target | None, str | Non
                 "features.updates.channel to 'branch' to follow the default branch"
             )
         tag = tags[0].strip()
-        code, sha, err = _git(root, "rev-parse", f"refs/tags/{tag}^{{commit}}")
+        code, sha, err = _git(root, "rev-parse", f"{_TAG_NAMESPACE}{tag}^{{commit}}")
         if code != 0:
             return None, f"could not resolve {tag} ({err or 'git failed'})"
         return _Target("release", tag, sha), None
@@ -621,7 +638,16 @@ def _verify_signature(root: Path, target: _Target) -> tuple[bool, str]:
     (``git verify-commit``; GitHub signs the merges it makes).
     """
     if target.kind == "release":
-        code, out, err = _git(root, "verify-tag", f"refs/tags/{target.name}")
+        ref = f"{_TAG_NAMESPACE}{target.name}"
+        # verify-tag checks the signature, not that the signed object is
+        # this tag: a signed v2.1.0-rc1 republished as v2.1.0 would pass.
+        _, own_name, _ = _git(root, "for-each-ref", "--format=%(tag)", ref)
+        if own_name != target.name:
+            return False, (
+                f"the signed tag object is named {own_name or 'nothing'!r}, "
+                f"not {target.name!r}"
+            )
+        code, out, err = _git(root, "verify-tag", ref)
     else:
         code, out, err = _git(root, "verify-commit", target.sha)
     detail = (err or out or "").strip()
@@ -854,15 +880,21 @@ def _startup_check_command(install: Installation, config_path: Path | None) -> l
 #: (``systemd-run``): ``systemctl restart`` kills every process in the
 #: service's cgroup, so a child of the server would die with it. All values
 #: arrive through argv, never interpolated into the script. It restarts the
-#: service, waits for the new process to answer /health (and still answer
-#: ``settle`` seconds later, so a crash loop is not mistaken for a start), and
+#: service, waits for the new process to answer /health (and keep answering
+#: for ``settle`` seconds with the same MainPID and NRestarts, so a crash
+#: loop is not mistaken for a start), and
 #: otherwise resets the checkout to the previous revision,
 #: reinstalls its pinned dependencies and restarts again. The outcome lands in
 #: STATUS_FILE so the next check (and the operator) can see it.
+#:
+#: The script must never contain a dollar-brace or a double dollar: PID 1
+#: expands ``${VAR}`` (and collapses ``$$``) in the ExecStart of the
+#: transient unit before ``sh`` sees it, so ``${10}`` would arrive empty.
 _WATCHDOG_SCRIPT = r"""
 delay=$1 service=$2 url=$3 root=$4 from=$5 to=$6 py=$7 status=$8 wait=$9
-settle=${10}
-shift 10
+shift 9
+settle=$1
+shift
 log() { echo "beaconmcp-update: $*"; }
 write_status() {
   printf '{"at": %s, "from": "%s", "to": "%s", "outcome": "%s"}\n' \
@@ -872,16 +904,28 @@ healthy() {
   "$py" -c 'import sys, urllib.request as u; u.build_opener(u.ProxyHandler({})).open(sys.argv[1], timeout=3).read()' \
     "$url" >/dev/null 2>&1
 }
+ident() {
+  systemctl show -p MainPID -p NRestarts --value "$service" 2>/dev/null | tr '\n' ' '
+}
+stable() { healthy && [ "$(ident)" = "$first" ]; }
 wait_healthy() {
   end=$(( $(date +%s) + wait ))
   while [ "$(date +%s)" -lt "$end" ]; do
     if healthy; then
-      sleep "$settle"
-      if healthy; then return 0; fi
+      first=$(ident)
+      waited=0
+      while [ "$waited" -lt "$settle" ] && stable; do
+        sleep 2
+        waited=$((waited + 2))
+      done
+      if [ "$waited" -ge "$settle" ] && stable; then return 0; fi
     fi
     sleep 2
   done
   return 1
+}
+pip_install() {
+  if command -v timeout >/dev/null 2>&1; then timeout 900 "$@"; else "$@"; fi
 }
 sleep "$delay"
 systemctl restart "$service"
@@ -890,7 +934,7 @@ if wait_healthy; then
   log "$to is up and healthy"
   exit 0
 fi
-log "no healthy answer from $url within ${wait}s; rolling back to $from"
+log "no steady healthy answer from $url within $wait seconds; rolling back to $from"
 if [ "$(git -C "$root" rev-parse HEAD)" != "$to" ]; then
   write_status superseded
   log "the checkout is no longer at $to (another update ran); not rolling back"
@@ -898,7 +942,7 @@ if [ "$(git -C "$root" rev-parse HEAD)" != "$to" ]; then
 fi
 if git -C "$root" reset --hard "$from"; then
   cd "$root" || exit 1
-  if [ -f constraints.txt ]; then "$@" install -e . -c constraints.txt; else "$@" install -e .; fi \
+  if [ -f constraints.txt ]; then pip_install "$@" install -e . -c constraints.txt; else pip_install "$@" install -e .; fi \
     || log "reinstalling the dependencies of $from FAILED; run pip install by hand"
   systemctl restart "$service"
   if wait_healthy; then
@@ -927,7 +971,7 @@ class _Watchdog:
     python: str
     pip: list[str]
     wait_seconds: int = HEALTH_WAIT_SECONDS
-    settle_seconds: int = 10
+    settle_seconds: int = _SETTLE_SECONDS
 
 
 def _write_status(root: Path, payload: dict[str, Any]) -> None:
@@ -1167,7 +1211,10 @@ def _apply_update_locked(
     result.ok = True
 
     watched = False
-    if restart and install.service:
+    # A unit file on disk does not mean this process runs under it: restarting
+    # the unit while `beaconmcp serve` runs by hand would leave this process
+    # answering /health and the watchdog calling the update healthy.
+    if restart and install.service and install.under_systemd:
         watchdog = None
         if _runtime.health_url:
             watchdog = _Watchdog(
@@ -1209,7 +1256,7 @@ def _apply_update_locked(
                 f"If it does not answer /health within {HEALTH_WAIT_SECONDS}s it is "
                 f"rolled back to {result.from_ref} automatically."
             )
-    elif install.service:
+    elif install.service and install.under_systemd:
         bits.append(f"Restart it with: systemctl restart {install.service}")
     else:
         bits.append("Restart the server process to run the new code.")

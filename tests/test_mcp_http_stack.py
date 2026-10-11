@@ -39,6 +39,12 @@ _CI_ENV = {
 @pytest.fixture
 def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Build the app exactly as `_cmd_serve` does and return it with a bearer."""
+    return _build_stack(tmp_path, monkeypatch)
+
+
+def _build_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, yaml_origins: list[str] | None = None,
+) -> dict[str, Any]:
     for key, value in _CI_ENV.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("BEACONMCP_CONFIG", str(ROOT / "beaconmcp.yaml.example"))
@@ -50,7 +56,13 @@ def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     from beaconmcp import __main__ as entry
     from beaconmcp import auth
-    from beaconmcp.server import mcp
+    from beaconmcp.server import config, mcp, transport_security
+
+    if yaml_origins is not None:
+        # What server.py computes when the YAML list is empty: its built-in
+        # fallback goes to the SDK, the YAML value stays empty.
+        monkeypatch.setattr(config.server, "allowed_origins", yaml_origins)
+        monkeypatch.setattr(transport_security, "allowed_origins", ["https://claude.ai"])
 
     captured: dict[str, Any] = {}
     # `_run_http` does `import uvicorn` locally, so patching the attribute on
@@ -67,6 +79,7 @@ def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     # least invasive way to mint a token that the middleware will accept.
     token, _ttl = auth._active_token_store.issue(client_id)
     captured["token"] = token
+    captured["client_id"] = client_id
     return captured
 
 
@@ -118,6 +131,25 @@ async def _handshake(c: httpx.AsyncClient, token: str, path: str = "/mcp") -> di
     done = await c.post(path, json=_rpc("notifications/initialized"), headers=h)
     assert done.status_code == 202, done.text
     return h
+
+
+async def test_authorize_trusts_claude_without_yaml_origins(tmp_path, monkeypatch) -> None:
+    # With server.allowed_origins left out of beaconmcp.yaml the SDK falls back
+    # to its built-in list for CORS; the OAuth redirect check must use that
+    # same list, or the Claude connector gets a 400 on a default install.
+    stack = _build_stack(tmp_path, monkeypatch, yaml_origins=[])
+    app = stack["app"]
+    params = {
+        "response_type": "code",
+        "client_id": stack["client_id"],
+        "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+        "state": "s",
+        "code_challenge": "x" * 43,
+        "code_challenge_method": "S256",
+    }
+    async with app.router.lifespan_context(app), _client(app) as c:
+        resp = await c.get("/oauth/authorize", params=params)
+    assert resp.status_code == 200, resp.text
 
 
 def test_stop_does_not_wait_forever_on_open_requests(stack) -> None:

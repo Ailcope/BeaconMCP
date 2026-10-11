@@ -106,6 +106,11 @@ class TotpLockout:
     whose cooldown has passed starts again from zero. A success clears the
     caller's own per-source counter only, so a distributed guesser can't
     reset the per-client cap by having the owner log in.
+
+    A source that entered a valid code recently is exempt from the
+    per-client cap (its own per-source cap still applies). Otherwise
+    anyone with two addresses could spend the per-client budget every
+    cooldown and keep the owner locked out of every TOTP path for good.
     """
 
     def __init__(
@@ -114,13 +119,17 @@ class TotpLockout:
         per_source: int = 5,
         per_client: int = 10,
         lockout_seconds: float = 300.0,
+        known_good_seconds: float = 30 * 86400.0,
     ) -> None:
         self._per_source = per_source
         self._per_client = per_client
         self._lockout = lockout_seconds
+        self._known_good_ttl = known_good_seconds
         # key -> (failures, cooldown_until). Keys are ("src", client_id, ip)
         # and ("client", client_id).
         self._strikes: dict[tuple[str, ...], tuple[int, float]] = {}
+        # ("src", client_id, ip) -> until: sources that passed TOTP lately.
+        self._known_good: dict[tuple[str, ...], float] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -137,14 +146,24 @@ class TotpLockout:
             return 0
         return count
 
+    def _is_known_good(self, key: tuple[str, ...], now: float) -> bool:
+        until = self._known_good.get(key)
+        if until is None:
+            return False
+        if now >= until:
+            del self._known_good[key]
+            return False
+        return True
+
     def locked(self, client_id: str, ip: str | None = None) -> bool:
         now = time.time()
+        src = self._src_key(client_id, ip)
         with self._lock:
-            return (
-                self._count_locked(("client", client_id), now) >= self._per_client
-                or self._count_locked(self._src_key(client_id, ip), now)
-                >= self._per_source
-            )
+            if self._count_locked(src, now) >= self._per_source:
+                return True
+            if self._is_known_good(src, now):
+                return False
+            return self._count_locked(("client", client_id), now) >= self._per_client
 
     def record_failure(self, client_id: str, ip: str | None = None) -> None:
         now = time.time()
@@ -158,8 +177,18 @@ class TotpLockout:
                         del self._strikes[key]
 
     def record_success(self, client_id: str, ip: str | None = None) -> None:
+        now = time.time()
+        src = self._src_key(client_id, ip)
         with self._lock:
-            self._strikes.pop(self._src_key(client_id, ip), None)
+            self._strikes.pop(src, None)
+            self._known_good[src] = now + self._known_good_ttl
+            if len(self._known_good) > 4096:
+                for key, until in list(self._known_good.items()):
+                    if now >= until:
+                        del self._known_good[key]
+                # Still full: forget the oldest, the cap only bounds memory.
+                while len(self._known_good) > 4096:
+                    del self._known_good[min(self._known_good, key=self._known_good.__getitem__)]
 
 
 def _coerce_ip(value: object) -> str | None:
@@ -214,22 +243,25 @@ _forwarding_warned = False
 
 
 def _warn_untrusted_forwarding(forwarded_for: str | None, peer: str | None) -> None:
-    """Say once that a proxy is forwarding but ``trusted_proxies`` is empty.
+    """Say once that a proxy is forwarding but is not in ``trusted_proxies``.
 
     Behind a reverse proxy every request then comes from the proxy's own
     address, so the per-IP limits (login, authorize, TOTP lockout) become
     one budget shared by every visitor, and one attacker can spend it for
-    everyone.
+    everyone. Also fires with a non-empty list: a cloudflared tunnel
+    connects from its own LAN address, which ``cloudflare`` (the edge
+    ranges) does not cover.
     """
     global _forwarding_warned
     if _forwarding_warned or not forwarded_for:
         return
     _forwarding_warned = True
     logging.getLogger("beaconmcp").warning(
-        "X-Forwarded-For received from %s but server.trusted_proxies is empty: "
+        "X-Forwarded-For received from %s, which is not in server.trusted_proxies: "
         "every client behind that proxy shares one rate-limit and TOTP-lockout "
-        "budget. Add the proxy's address to server.trusted_proxies.",
-        peer or "an unknown peer",
+        "budget. If %s is your reverse proxy or cloudflared tunnel, add it to "
+        "server.trusted_proxies.",
+        peer or "an unknown peer", peer or "it",
     )
 
 
@@ -246,9 +278,10 @@ def client_ip(request: object, trusted_proxies: tuple[str, ...] = ()) -> str:
     direct_ip = _coerce_ip(direct_peer_raw)
 
     headers = getattr(request, "headers", None)
-    if not trusted_proxies and headers is not None and hasattr(headers, "get"):
+    peer_trusted = bool(direct_ip) and _is_trusted_proxy(direct_ip, trusted_proxies)
+    if not peer_trusted and headers is not None and hasattr(headers, "get"):
         _warn_untrusted_forwarding(headers.get("x-forwarded-for"), direct_ip)
-    if headers is not None and direct_ip and _is_trusted_proxy(direct_ip, trusted_proxies):
+    if headers is not None and peer_trusted:
         fwd = headers.get("x-forwarded-for") if hasattr(headers, "get") else None
         if fwd:
             chain: list[str] = [

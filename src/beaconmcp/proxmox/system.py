@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpcore
 import httpx
 from mcp.server.mcpserver import MCPServer
 
@@ -40,24 +41,55 @@ _EXEC_SESSION_TTL = 3600
 
 
 def _prune_exec_sessions() -> None:
+    # Runs on executor threads while other threads add sessions: snapshot the
+    # items first, or the dict can change size under the iteration.
     now = time.time()
     stale = [
         eid
-        for eid, s in _exec_sessions.items()
+        for eid, s in list(_exec_sessions.items())
         if s.status != "running" and now - s.started_at > _EXEC_SESSION_TTL
     ]
     for eid in stale:
-        del _exec_sessions[eid]
+        _exec_sessions.pop(eid, None)
 
 
-def _detect_vm_type(client: ProxmoxClient, node: str, vmid: int) -> str | None:
+def _detect_guest(client: ProxmoxClient, node: str, vmid: int) -> tuple[str, str] | None:
+    """``(vm_type, status)`` of a guest, e.g. ``("lxc", "running")``."""
     for vm_type in ("qemu", "lxc"):
         data = client.get(node, f"nodes/{node}/{vm_type}/{vmid}/status/current")
         if isinstance(data, dict) and "error" in data:
             continue
         if isinstance(data, dict) and data.get("status"):
-            return vm_type
+            return vm_type, str(data["status"])
     return None
+
+
+def _detect_vm_type(client: ProxmoxClient, node: str, vmid: int) -> str | None:
+    guest = _detect_guest(client, node, vmid)
+    return guest[0] if guest else None
+
+
+async def _running_guest(
+    client: ProxmoxClient, node: str, vmid: int,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve a push target: ``(vm_type, None)`` or ``(None, error result)``.
+
+    Files can only be pushed into a running guest (``pct push`` refuses a
+    stopped CT, a stopped VM has no SSH), so check it up front rather than
+    after the bytes were transferred.
+    """
+    loop = asyncio.get_running_loop()
+    guest = await loop.run_in_executor(None, _detect_guest, client, node, vmid)
+    if guest is None:
+        return None, {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+    vm_type, status = guest
+    if status != "running":
+        return None, {
+            "status": "error",
+            "error": f"VM/CT {vmid} is {status}: start it first, files can only be pushed into a running guest.",
+            "guest_status": status,
+        }
+    return vm_type, None
 
 
 #: Added to an agent/exec error when the guest OS could not be detected, so a
@@ -81,6 +113,11 @@ def _guest_argv(
     ``cmd.exe /c`` instead. When the agent can't report its OS (old agent,
     command blocked), assume a POSIX guest, which is by far the common case,
     and return a hint to attach to an exec error (``None`` when the OS is known).
+
+    On Windows the agent joins the argv into one command line with C runtime
+    quoting (``"`` becomes ``\\"``), which cmd.exe does not understand: a
+    command that itself contains double quotes can reach cmd.exe mangled.
+    Commands without inner double quotes are unaffected.
     """
     info = client.get(node, f"nodes/{node}/qemu/{vmid}/agent/get-osinfo")
     result = info.get("result") if isinstance(info, dict) else None
@@ -131,6 +168,40 @@ def _sha256_file(path: Path) -> str:
 
 # Hard cap for the guest-agent file-read path (matches proxmox_write_file).
 _FILE_READ_MAX_BYTES = 1024 * 1024
+#: PVE caps agent/file-write ``content`` at 60 KiB, and the content goes
+#: base64-encoded (4/3 larger): 45 KiB of raw bytes is what fits.
+_FILE_WRITE_MAX_BYTES = 45 * 1024
+
+
+def _agent_read_bytes(
+    client: ProxmoxClient, node: str, vmid: int, path: str,
+) -> bytes | dict[str, Any]:
+    """Raw bytes of a guest file via agent/file-read, or an error result.
+
+    Reads one byte past the limit so an oversized file is told apart from
+    one exactly at it. ``decode=0`` keeps the guest agent's base64 as is:
+    PVE's default decodes it server-side and the bytes then come back as
+    JSON text, which isn't base64 any more.
+    """
+    api = f"nodes/{node}/qemu/{vmid}/agent/file-read"
+    count = _FILE_READ_MAX_BYTES + 1
+    result = client.get(node, api, file=path, count=count, decode=0)
+    legacy = False
+    if isinstance(result, dict) and "error" in result and "decode" in str(result["error"]):
+        # PVE before the `decode` parameter: content arrives decoded, one
+        # JSON code point per byte.
+        result = client.get(node, api, file=path, count=count)
+        legacy = True
+    if isinstance(result, dict) and "error" in result:
+        return {"status": "error", "error": result["error"]}
+    if not isinstance(result, dict) or not isinstance(result.get("content"), str):
+        return {"status": "error", "error": f"Unexpected file-read response: {result!r}"[:300]}
+    try:
+        if legacy:
+            return result["content"].encode("latin-1")
+        return base64.b64decode(result["content"], validate=True)
+    except (ValueError, UnicodeEncodeError) as e:
+        return {"status": "error", "error": f"Failed to decode file content: {e}"}
 
 
 def _qemu_file_size(client: ProxmoxClient, node: str, vmid: int, path: str) -> int | None:
@@ -192,9 +263,11 @@ async def _refuse_local_target(request: httpx.Request) -> None:
 
     Keeps proxmox_fetch_url from reading services that only listen on the
     BeaconMCP host (its own /metrics, the Proxmox API on 127.0.0.1) or a
-    cloud metadata endpoint into a guest. The address is resolved here and
-    again by httpx when it connects, so a DNS answer that changes in between
-    is not covered; this is a guard rail, not a sandbox.
+    cloud metadata endpoint into a guest. This early check gives a clear
+    error before any connection; the one that holds is
+    :class:`_GuardedNetworkBackend`, which connects to the very address it
+    checked (a DNS answer that changes between two lookups can't slip a
+    loopback address past it).
     """
     host = request.url.host
     try:
@@ -211,6 +284,89 @@ async def _refuse_local_target(request: httpx.Request) -> None:
             f"Refusing to fetch from {host} ({local}): loopback and link-local "
             "addresses are not allowed."
         )
+
+
+class _GuardedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Resolve once, refuse local addresses, connect to the checked IP.
+
+    TLS still verifies against the URL's hostname: httpcore takes the SNI
+    and certificate name from the request origin, not from this address.
+    Resolution failures fail closed.
+    """
+
+    def __init__(self) -> None:
+        self._inner = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            ipaddress.ip_address(host)
+            addrs = [host]
+        except ValueError:
+            try:
+                addrs = await _host_addresses(host)
+            except OSError as e:
+                raise httpcore.ConnectError(f"cannot resolve {host}: {e}") from e
+        if not addrs:
+            raise httpcore.ConnectError(f"cannot resolve {host}")
+        local = next((a for a in addrs if _is_local_address(a)), None)
+        if local is not None:
+            raise _LocalTargetRefused(
+                f"Refusing to fetch from {host} ({local}): loopback and link-local "
+                "addresses are not allowed."
+            )
+        return await self._inner.connect_tcp(
+            addrs[0], port, timeout=timeout,
+            local_address=local_address, socket_options=socket_options,
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _fetch_transport() -> httpx.AsyncBaseTransport:
+    """Transport for proxmox_fetch_url: every connection goes through the guard.
+
+    Passing a transport also turns off HTTP(S)_PROXY from the environment:
+    a proxy would resolve the name itself, out of the guard's reach.
+    """
+    transport = httpx.AsyncHTTPTransport()
+    transport._pool = httpcore.AsyncConnectionPool(
+        ssl_context=httpx.create_ssl_context(),
+        network_backend=_GuardedNetworkBackend(),
+    )
+    return transport
+
+
+async def _remove_quietly(ssh_client: Any, host: str, path: str) -> None:
+    """Best-effort cleanup that also runs when the caller is being cancelled
+    (a restart cancels in-flight requests after a few seconds)."""
+    try:
+        await asyncio.shield(ssh_client.sftp_remove(host, path))
+    except (Exception, asyncio.CancelledError):
+        pass
+
+
+def _checksum_from(sum_res: dict[str, Any]) -> tuple[str | None, str | None]:
+    """``(sha, error)`` from a ``sha256sum <dest>`` run in the guest.
+
+    Only a missing ``sha256sum`` (exit 127) or no output counts as "can't
+    verify". Any other failure (a directory, no permission, a wrong path)
+    means the file is not where the caller asked, so it is an error.
+    """
+    code = sum_res.get("exit_code")
+    if code == 0 and sum_res.get("stdout"):
+        return sum_res["stdout"].split()[0], None
+    if code in (0, 127):
+        return None, None
+    detail = (sum_res.get("stderr") or sum_res.get("error") or f"exit {code}").strip()
+    return None, f"Checksum check of the pushed file failed: {detail}"
 
 
 async def _push_staged(
@@ -233,9 +389,9 @@ async def _push_staged(
     size_bytes = local_path.stat().st_size
 
     loop = asyncio.get_running_loop()
-    vm_type = await loop.run_in_executor(None, _detect_vm_type, client, node, vmid)
-    if not vm_type:
-        return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+    vm_type, err = await _running_guest(client, node, vmid)
+    if err is not None:
+        return err
 
     started = time.monotonic()
     local_sha = await loop.run_in_executor(None, _sha256_file, local_path) if verify_checksum else None
@@ -243,15 +399,19 @@ async def _push_staged(
     if vm_type == "lxc":
         node_tmp = f"/tmp/beaconmcp-upload-{uuid.uuid4().hex[:12]}"
         try:
-            await ssh_client.sftp_put(node, str(local_path), node_tmp)
-        except Exception as e:
-            return {"status": "error", "error": f"SFTP to node {node!r} failed: {e}"}
-        push_res = await ssh_client.exec_command(
-            node,
-            f"pct push {vmid} {shlex.quote(node_tmp)} {shlex.quote(dest)}",
-            timeout=600,
-        )
-        await ssh_client.sftp_remove(node, node_tmp)
+            try:
+                await ssh_client.sftp_put(node, str(local_path), node_tmp)
+            except Exception as e:
+                return {"status": "error", "error": f"SFTP to node {node!r} failed: {e}"}
+            push_res = await ssh_client.exec_command(
+                node,
+                f"pct push {vmid} {shlex.quote(node_tmp)} {shlex.quote(dest)}",
+                timeout=600,
+            )
+        finally:
+            # Also after a partial SFTP (full /tmp) or a cancelled request:
+            # the node's /tmp must not keep the copy.
+            await _remove_quietly(ssh_client, node, node_tmp)
         if push_res.get("exit_code") != 0:
             return {
                 "status": "error",
@@ -264,8 +424,9 @@ async def _push_staged(
                 f"pct exec {vmid} -- sha256sum {shlex.quote(dest)}",
                 timeout=300,
             )
-            if sum_res.get("exit_code") == 0 and sum_res.get("stdout"):
-                remote_sha = sum_res["stdout"].split()[0]
+            remote_sha, sum_err = _checksum_from(sum_res)
+            if sum_err:
+                return {"status": "error", "error": sum_err, "bytes": size_bytes}
             if remote_sha and remote_sha != local_sha:
                 return {
                     "status": "error",
@@ -297,6 +458,16 @@ async def _push_staged(
                 "or use proxmox_write_file for files ≤1MB."
             ),
         }
+    # SFTP put into an existing directory would drop the file inside it
+    # under the staging name (upload-<id>), not at `dest`.
+    dir_check = await ssh_client.exec_command(
+        str(vmid), f"test -d {shlex.quote(dest)}", timeout=30,
+    )
+    if dir_check.get("exit_code") == 0:
+        return {
+            "status": "error",
+            "error": f"`dest` {dest!r} is a directory in VM {vmid}: give the full file path.",
+        }
     try:
         await ssh_client.sftp_put(str(vmid), str(local_path), dest)
     except Exception as e:
@@ -306,8 +477,9 @@ async def _push_staged(
         sum_res = await ssh_client.exec_command(
             str(vmid), f"sha256sum {shlex.quote(dest)}", timeout=300,
         )
-        if sum_res.get("exit_code") == 0 and sum_res.get("stdout"):
-            remote_sha = sum_res["stdout"].split()[0]
+        remote_sha, sum_err = _checksum_from(sum_res)
+        if sum_err:
+            return {"status": "error", "error": sum_err, "bytes": size_bytes}
         if remote_sha and remote_sha != local_sha:
             return {
                 "status": "error",
@@ -372,31 +544,26 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
                         "limit. Use proxmox_download_file for large files."
                     ),
                 }
-            result = await loop.run_in_executor(
-                None,
-                lambda: client.get(node, f"nodes/{node}/qemu/{vmid}/agent/file-read", file=path),
+            data = await loop.run_in_executor(
+                None, _agent_read_bytes, client, node, vmid, path,
             )
-            if isinstance(result, dict) and "error" in result:
-                return {"status": "error", "error": result["error"]}
-            # QEMU Guest Agent returns file content base64-encoded
+            if isinstance(data, dict):
+                return data
+            if len(data) > _FILE_READ_MAX_BYTES:
+                return {
+                    "status": "error",
+                    "error": "File exceeds the 1MB guest-agent read limit. Use proxmox_download_file for large files.",
+                }
+            if binary:
+                return {
+                    "status": "success", "vmid": vmid, "node": node, "path": path,
+                    "content_base64": base64.b64encode(data).decode("ascii"),
+                }
             try:
-                if isinstance(result, dict) and "content" in result:
-                    import base64
-                    raw_b64 = result["content"]
-                    if len(raw_b64) > 1398101: # ~1MB limit in base64
-                        return {"status": "error", "error": "File exceeds 1MB limit. Use SSH to download large files."}
-                    
-                    if binary:
-                        return {"status": "success", "vmid": vmid, "node": node, "path": path, "content_base64": raw_b64}
-                        
-                    try:
-                        content = base64.b64decode(raw_b64).decode("utf-8")
-                        return {"status": "success", "vmid": vmid, "node": node, "path": path, "content": content}
-                    except UnicodeDecodeError:
-                        return {"status": "error", "error": "Binary data detected. Pass binary=True to retrieve as base64."}
-                return {"status": "success", "vmid": vmid, "node": node, "path": path, "content": str(result)}
-            except Exception as e:
-                return {"status": "error", "error": f"Failed to decode file content: {e}"}
+                content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return {"status": "error", "error": "Binary data detected. Pass binary=True to retrieve as base64."}
+            return {"status": "success", "vmid": vmid, "node": node, "path": path, "content": content}
         
         return {"status": "error", "error": "LXC file reading is currently unsupported via API. Please use ssh_run to cat the file."}
 
@@ -413,17 +580,26 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
         if not vm_type:
             return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
             
-        if len(content.encode("utf-8")) > 1024 * 1024:
-            return {"status": "error", "error": "Content exceeds 1MB limit. Use SSH for large files."}
-            
+        raw = content.encode("utf-8")
+        if len(raw) > _FILE_WRITE_MAX_BYTES:
+            return {
+                "status": "error",
+                "error": (
+                    f"Content is {len(raw)} bytes, over the {_FILE_WRITE_MAX_BYTES} byte "
+                    "guest-agent write limit. Use proxmox_upload_link or proxmox_upload_file."
+                ),
+            }
+
         if vm_type == "qemu":
-            import base64
-            encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+            # encode=0: the content is already base64. With PVE's default
+            # (encode=1) it would be encoded a second time and the guest
+            # would get the base64 text instead of the file.
+            encoded = base64.b64encode(raw).decode("ascii")
             result = await loop.run_in_executor(
                 None,
                 lambda: client.post(
                     node, f"nodes/{node}/qemu/{vmid}/agent/file-write",
-                    file=path, content=encoded, encode=1,
+                    file=path, content=encoded, encode=0,
                 ),
             )
             if isinstance(result, dict) and "error" in result:
@@ -791,10 +967,9 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
             return {"status": "error", "error": "`node` and `vmid` are required to mint a link."}
         if not isinstance(dest, str) or not dest.startswith("/"):
             return {"status": "error", "error": "`dest` must be an absolute path inside the guest."}
-        loop = asyncio.get_running_loop()
-        vm_type = await loop.run_in_executor(None, _detect_vm_type, client, node, vmid)
-        if not vm_type:
-            return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+        vm_type, err = await _running_guest(client, node, vmid)
+        if err is not None:
+            return err
 
         max_bytes = client._config.server.transfers_max_mb * 1024 * 1024
         try:
@@ -860,9 +1035,9 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
         if not isinstance(dest, str) or not dest.startswith("/"):
             return {"status": "error", "error": "`dest` must be an absolute path inside the guest."}
         # Check the target before pulling a possibly large file for nothing.
-        loop = asyncio.get_running_loop()
-        if not await loop.run_in_executor(None, _detect_vm_type, client, node, vmid):
-            return {"status": "error", "error": f"VM/CT {vmid} not found on node '{node}'."}
+        _vm_type, err = await _running_guest(client, node, vmid)
+        if err is not None:
+            return err
 
         max_bytes = client._config.server.transfers_max_mb * 1024 * 1024
         staged = _staging_dir(client) / f"fetch-{uuid.uuid4().hex[:12]}"
@@ -873,6 +1048,7 @@ def register_system_tools(mcp: MCPServer, client: ProxmoxClient, ssh_client: Any
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=min(max(timeout, 10), 1800),
                 event_hooks={"request": [_refuse_local_target]},
+                transport=_fetch_transport(),
             ) as http:
                 async with http.stream("GET", url) as resp:
                     if resp.status_code >= 400:

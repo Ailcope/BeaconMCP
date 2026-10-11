@@ -55,6 +55,37 @@ def _detect_vm_type(client: ProxmoxClient, node: str, vmid: int) -> str | None:
     return None
 
 
+#: Added to an agent/exec error when the guest OS could not be detected, so a
+#: Windows guest whose agent blocks guest-get-osinfo is not left guessing.
+_OS_UNKNOWN_HINT = (
+    "The guest agent did not report its OS (guest-get-osinfo failed or is "
+    "blocked), so the command was run through /bin/sh -c. On a Windows guest, "
+    "allow guest-get-osinfo in the agent so cmd.exe /c is used instead."
+)
+
+
+def _guest_argv(
+    client: ProxmoxClient, node: str, vmid: int, command: str,
+) -> tuple[list[str], str | None]:
+    """Wrap ``command`` in the guest's shell for the QEMU guest agent.
+
+    ``agent/exec`` takes an argv and runs it without a shell, so pipes,
+    redirections, ``&&`` and quoting would otherwise reach the program as
+    literal arguments. LXC commands already go through ``sh -c``; this gives
+    QEMU guests the same semantics. Windows guests have no ``/bin/sh`` and get
+    ``cmd.exe /c`` instead. When the agent can't report its OS (old agent,
+    command blocked), assume a POSIX guest, which is by far the common case,
+    and return a hint to attach to an exec error (``None`` when the OS is known).
+    """
+    info = client.get(node, f"nodes/{node}/qemu/{vmid}/agent/get-osinfo")
+    result = info.get("result") if isinstance(info, dict) else None
+    if not isinstance(result, dict) or not result.get("id"):
+        return ["/bin/sh", "-c", command], _OS_UNKNOWN_HINT
+    if result.get("id") == "mswindows":
+        return ["cmd.exe", "/c", command], None
+    return ["/bin/sh", "-c", command], None
+
+
 def _staging_dir(client: ProxmoxClient) -> Path:
     """Return the resolved staging directory, creating it on first use."""
     base = Path(client._config.server.transfers_dir).expanduser().resolve()
@@ -713,12 +744,15 @@ def register_system_tools(mcp: FastMCP, client: ProxmoxClient, ssh_client: Any =
         )
         _exec_sessions[exec_id] = session
 
-        parts = shlex.split(command)
+        parts, os_hint = _guest_argv(client, node, vmid, command)
         result = client.post(node, f"nodes/{node}/qemu/{vmid}/agent/exec", command=parts)
         if isinstance(result, dict) and "error" in result:
+            error = str(result["error"])
+            if os_hint:
+                error = f"{error} ({os_hint})"
             session.status = "failed"
-            session.stderr = str(result["error"])
-            return {"exec_id": exec_id, "status": "failed", "error": result["error"]}
+            session.stderr = error
+            return {"exec_id": exec_id, "status": "failed", "error": error}
         session.pid = result.get("pid") if isinstance(result, dict) else None
         return {"exec_id": exec_id, "status": "running"}
 
@@ -783,6 +817,11 @@ def register_system_tools(mcp: FastMCP, client: ProxmoxClient, ssh_client: Any =
         exec_id: str = "",
     ) -> dict[str, Any]:
         """Run a command inside a VM (QEMU Guest Agent) or container (LXC pct exec).
+
+        ``command`` is a shell command line in both cases: pipes, redirections,
+        ``&&`` and quoting work. Linux/Unix VMs and containers run it with
+        ``sh -c``; Windows VMs run it with ``cmd.exe /c`` (cmd syntax, not
+        PowerShell; double quotes inside the command may not survive).
 
         Three call patterns:
         - **Sync** (default): pass ``node``, ``vmid``, ``command``. Blocks up to ``timeout`` seconds (max 600).

@@ -25,7 +25,6 @@ from typing import Any, AsyncIterator
 import httpx2
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from pydantic import AnyUrl
 
 # Extension identifier and content type from the MCP Apps spec (SEP-1865).
 UI_EXTENSION_ID = "io.modelcontextprotocol/ui"
@@ -144,7 +143,8 @@ async def read_ui_resource(session: ClientSession, uri: str) -> str:
     if not uri.startswith("ui://"):
         raise UiResourceError("not a ui:// resource")
     try:
-        result = await session.read_resource(AnyUrl(uri))
+        # mcp 2.x takes a plain str: an AnyUrl fails request validation.
+        result = await session.read_resource(uri)
     except Exception as exc:  # noqa: BLE001
         raise UiResourceError(str(exc)) from exc
 

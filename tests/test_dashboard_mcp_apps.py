@@ -169,6 +169,9 @@ class _FakeSession:
         self._contents = contents
 
     async def read_resource(self, uri):
+        # Like mcp 2.x's ClientSession: ReadResourceRequestParams.uri is a
+        # strict str, an AnyUrl is rejected before anything is sent.
+        assert type(uri) is str, f"read_resource needs a str, got {type(uri).__name__}"
         return _FakeReadResult(self._contents)
 
 

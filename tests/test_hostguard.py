@@ -152,3 +152,24 @@ async def test_non_http_scopes_are_passed_through() -> None:
     guard = HostGuardMiddleware(inner, allowed_hosts=ALLOWED)
     await guard({"type": "lifespan"}, None, None)
     assert seen == ["lifespan"]
+
+
+async def test_rejection_is_logged_with_host_peer_and_path(caplog) -> None:
+    # Same wording as the SDK on /mcp. Every route can answer 421 now, so an
+    # allowlist one entry short must be diagnosable from the journal.
+    with caplog.at_level("WARNING", logger="beaconmcp"):
+        async with _client(_app(), peer="203.0.113.9") as c:
+            await c.get("/app/login", headers={"Host": "attacker.test"})
+    msgs = [r.getMessage() for r in caplog.records if "Invalid Host header" in r.getMessage()]
+    assert msgs == ["Invalid Host header: attacker.test (Host, from 203.0.113.9, GET /app/login)"]
+
+
+async def test_forwarded_host_rejection_names_the_forwarded_value(caplog) -> None:
+    app = _app(trusted_proxies=("10.0.0.0/8",))
+    with caplog.at_level("WARNING", logger="beaconmcp"):
+        async with _client(app, peer="10.1.2.3") as c:
+            await c.get(
+                "/", headers={"Host": "beacon.example", "X-Forwarded-Host": "attacker.test"},
+            )
+    msgs = [r.getMessage() for r in caplog.records if "Invalid Host header" in r.getMessage()]
+    assert msgs == ["Invalid Host header: attacker.test (X-Forwarded-Host, from 10.1.2.3, GET /)"]

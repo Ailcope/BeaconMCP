@@ -91,7 +91,7 @@ def b64url_decode(value: str) -> bytes:
 # Relying-party identity, derived from the live request
 # ---------------------------------------------------------------------------
 
-def _forwarded_host(request: "Request", trusted_proxies: tuple[str, ...] = ()) -> str:
+def _forwarded_host(request: "Request", trusted_proxies: tuple[str, ...]) -> str:
     # Same trust model as the OAuth issuer: X-Forwarded-Host only from a
     # declared proxy, the request's own Host otherwise. Binding a credential
     # to an attacker-supplied header would lose it for the real hostname.
@@ -99,7 +99,7 @@ def _forwarded_host(request: "Request", trusted_proxies: tuple[str, ...] = ()) -
     return forwarded_host(request, trusted_proxies, default=default)
 
 
-def rp_id_for(request: "Request", trusted_proxies: tuple[str, ...] = ()) -> str:
+def rp_id_for(request: "Request", trusted_proxies: tuple[str, ...]) -> str:
     """Return the WebAuthn RP ID (effective domain, no scheme, no port).
 
     Derived from the request rather than configured, so a deployment that
@@ -116,13 +116,13 @@ def rp_id_for(request: "Request", trusted_proxies: tuple[str, ...] = ()) -> str:
     return host.rsplit(":", 1)[0] if ":" in host else host
 
 
-def origin_for(request: "Request", trusted_proxies: tuple[str, ...] = ()) -> str:
+def origin_for(request: "Request", trusted_proxies: tuple[str, ...]) -> str:
     """Return the origin the browser will put in ``clientDataJSON``."""
     scheme = forwarded_scheme(request, trusted_proxies)
     return f"{scheme}://{_forwarded_host(request, trusted_proxies)}"
 
 
-def is_secure_context(request: "Request", trusted_proxies: tuple[str, ...] = ()) -> bool:
+def is_secure_context(request: "Request", trusted_proxies: tuple[str, ...]) -> bool:
     """True when the browser will expose ``navigator.credentials``.
 
     WebAuthn is gated on a secure context: HTTPS, or a loopback host. A

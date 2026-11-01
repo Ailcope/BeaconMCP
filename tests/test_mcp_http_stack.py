@@ -322,18 +322,27 @@ async def test_forwarded_host_from_trusted_proxy_must_be_allowlisted(
     assert good.json()["issuer"] == f"http://{HOST}"
 
 
-async def test_forwarded_proto_from_untrusted_peer_is_ignored_when_proxies_declared(
+async def test_forwarded_proto_trust_when_proxies_declared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from beaconmcp.server import config
 
-    # A trusted proxy is declared but the direct peer (127.0.0.1) is not it.
-    monkeypatch.setattr(config.server, "trusted_proxies", ["10.0.0.0/8"])
+    # trusted_proxies names Cloudflare's edge, as docs/cloudflare.md shows,
+    # but cloudflared itself connects from loopback: https must survive that
+    # (it did before forwarded_scheme existed). An internet peer that is not
+    # the declared proxy still cannot claim https.
+    monkeypatch.setattr(config.server, "trusted_proxies", ["173.245.48.0/20"])
     stack = _build_stack(tmp_path, monkeypatch)
     app = stack["app"]
-    async with app.router.lifespan_context(app), _client(app) as c:
-        resp = await c.get(
-            "/.well-known/oauth-authorization-server",
-            headers={"Host": HOST, "X-Forwarded-Proto": "https"},
-        )
-    assert resp.json()["issuer"] == f"http://{HOST}"
+    metadata = "/.well-known/oauth-authorization-server"
+    headers = {"Host": HOST, "X-Forwarded-Proto": "https"}
+    async with app.router.lifespan_context(app):
+        async with _client(app) as c:  # peer 127.0.0.1
+            local = await c.get(metadata, headers=headers)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("8.8.8.8", 4321)),
+            base_url=f"http://{HOST}",
+        ) as c:
+            public = await c.get(metadata, headers=headers)
+    assert local.json()["issuer"] == f"https://{HOST}"
+    assert public.json()["issuer"] == f"http://{HOST}"

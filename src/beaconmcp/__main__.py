@@ -1801,14 +1801,15 @@ def _run_http(mcp, host: str, port: int, *, serve: bool = True):
     if n_clients == 0:
         print("\nNo clients registered. Create one with: beaconmcp auth create --name 'My Client'")
     # proxy_headers=False: the app owns its own forwarded-header trust model
-    # end to end -- client_ip walks X-Forwarded-For against trusted_proxies and
-    # forwarded_host does the same for X-Forwarded-Host, both keyed on the real
-    # TCP peer. uvicorn's default ProxyHeadersMiddleware (proxy_headers=True,
-    # forwarded_allow_ips="127.0.0.1") rewrites scope["client"] to the XFF
-    # client before the app runs, which would hide the real peer from both
-    # helpers -- their trusted-proxy branch could never open. Every scheme read
-    # goes through the x-forwarded-proto header directly, so nothing else needs
-    # uvicorn to interpret the forwarded headers for us.
+    # end to end -- client_ip walks X-Forwarded-For against trusted_proxies,
+    # forwarded_host does the same for X-Forwarded-Host, and forwarded_scheme
+    # for X-Forwarded-Proto (trusted proxies plus non-global peers), all keyed
+    # on the real TCP peer. uvicorn's default ProxyHeadersMiddleware
+    # (proxy_headers=True, forwarded_allow_ips="127.0.0.1") rewrites
+    # scope["client"] to the XFF client and scope["scheme"] from XFP before
+    # the app runs, which would hide the real peer from all three helpers --
+    # their trusted-proxy branch could never open -- so nothing is left for
+    # uvicorn to interpret on our behalf.
     uvicorn.run(
         app,
         host=host,

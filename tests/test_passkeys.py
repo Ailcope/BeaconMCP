@@ -207,22 +207,22 @@ def test_rp_id_strips_port_and_scheme():
     from beaconmcp.dashboard.passkeys import origin_for, rp_id_for
 
     req = FakeRequest(host="beacon.example:8420")
-    assert rp_id_for(req) == "beacon.example"
-    assert origin_for(req) == "https://beacon.example:8420"
+    assert rp_id_for(req, ()) == "beacon.example"
+    assert origin_for(req, ()) == "https://beacon.example:8420"
 
 
 def test_rp_id_handles_ipv6_literal():
     from beaconmcp.dashboard.passkeys import rp_id_for
 
-    assert rp_id_for(FakeRequest(host="[::1]:8420")) == "::1"
+    assert rp_id_for(FakeRequest(host="[::1]:8420"), ()) == "::1"
 
 
 def test_secure_context_requires_https_or_loopback():
     from beaconmcp.dashboard.passkeys import is_secure_context
 
-    assert is_secure_context(FakeRequest(host="beacon.example", scheme="https"))
-    assert is_secure_context(FakeRequest(host="localhost:8420", scheme="http"))
-    assert not is_secure_context(FakeRequest(host="192.168.1.5:8420", scheme="http"))
+    assert is_secure_context(FakeRequest(host="beacon.example", scheme="https"), ())
+    assert is_secure_context(FakeRequest(host="localhost:8420", scheme="http"), ())
+    assert not is_secure_context(FakeRequest(host="192.168.1.5:8420", scheme="http"), ())
 
 
 def test_forwarded_host_ignored_without_trusted_proxy():
@@ -232,8 +232,8 @@ def test_forwarded_host_ignored_without_trusted_proxy():
 
     req = FakeRequest(host="internal:8420")
     req.headers["x-forwarded-host"] = "public.example"
-    assert rp_id_for(req) == "internal"
-    assert origin_for(req) == "https://internal:8420"
+    assert rp_id_for(req, ()) == "internal"
+    assert origin_for(req, ()) == "https://internal:8420"
 
 
 def test_forwarded_host_wins_over_host_from_trusted_proxy():

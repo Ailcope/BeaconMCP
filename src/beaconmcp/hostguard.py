@@ -17,15 +17,18 @@ rules as the SDK, to every HTTP request.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Iterable, Sequence
 
-from starlette.datastructures import Headers
+from starlette.requests import HTTPConnection
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .ratelimit import forwarded_host
 
 __all__ = ["HostGuardMiddleware", "host_allowed"]
+
+logger = logging.getLogger("beaconmcp")
 
 
 def host_allowed(host: str | None, allowed_hosts: Iterable[str]) -> bool:
@@ -88,39 +91,43 @@ class HostGuardMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = Headers(scope=scope)
-        raw_host = headers.get("host")
+        # HTTPConnection is the Request without a body: ``.headers`` and
+        # ``.client`` are exactly what forwarded_host() reads.
+        conn = HTTPConnection(scope)
+        raw_host = conn.headers.get("host")
         if not host_allowed(raw_host, self.allowed_hosts):
-            await self._reject(scope, receive, send)
+            await self._reject(conn, "Host", raw_host, scope, receive, send)
             return
 
-        if self.trusted_proxies and headers.get("x-forwarded-host"):
-            effective = forwarded_host(_ScopeView(scope, headers), self.trusted_proxies)
+        if self.trusted_proxies and conn.headers.get("x-forwarded-host"):
+            effective = forwarded_host(conn, self.trusted_proxies)
             if not host_allowed(effective, self.allowed_hosts):
-                await self._reject(scope, receive, send)
+                await self._reject(
+                    conn, "X-Forwarded-Host", effective, scope, receive, send,
+                )
                 return
 
         await self.app(scope, receive, send)
 
     @staticmethod
-    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+    async def _reject(
+        conn: HTTPConnection,
+        header: str,
+        value: str | None,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        # Same wording as the SDK's TransportSecurityMiddleware on /mcp, with
+        # the value and the peer: a 421 on every route is otherwise a blind
+        # spot when allowed_hosts is one entry short.
+        logger.warning(
+            "Invalid Host header: %s (%s, from %s, %s %s)",
+            value or "<missing>",
+            header,
+            conn.client.host if conn.client else "unknown peer",
+            scope.get("method", "?"),
+            scope.get("path", "?"),
+        )
         response = Response("Invalid Host header", status_code=421)
         await response(scope, receive, send)
-
-
-class _ScopeView:
-    """The two attributes :func:`forwarded_host` reads, without a Request."""
-
-    __slots__ = ("client", "headers")
-
-    def __init__(self, scope: Scope, headers: Headers) -> None:
-        self.headers = headers
-        client = scope.get("client")
-        self.client = _Peer(client[0]) if client else None
-
-
-class _Peer:
-    __slots__ = ("host",)
-
-    def __init__(self, host: str) -> None:
-        self.host = host

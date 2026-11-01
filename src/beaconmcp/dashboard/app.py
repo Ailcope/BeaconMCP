@@ -118,10 +118,12 @@ class DashboardDeps:
 # helpers
 # ---------------------------------------------------------------------------
 
-def _is_secure(request: Request, trusted_proxies: tuple[str, ...] = ()) -> bool:
-    # Drives the Secure flag on the session and CSRF cookies. Once
-    # trusted_proxies is declared, a direct caller can no longer downgrade it
-    # by omitting X-Forwarded-Proto (see ratelimit.forwarded_scheme).
+def _is_secure(request: Request, trusted_proxies: tuple[str, ...]) -> bool:
+    # Drives the Secure flag on the session and CSRF cookies, from the same
+    # scheme the OAuth issuer and the passkey origin use. A direct plain-HTTP
+    # request still gets a non-Secure cookie on that connection; what the
+    # trust model rules out is an undeclared internet peer dressing a plain
+    # connection up as https (see ratelimit.forwarded_scheme).
     return forwarded_scheme(request, trusted_proxies) == "https"
 
 
@@ -168,15 +170,21 @@ def _clear_session_cookies(response: Response) -> None:
 def _render(
     template: str,
     request: Request,
+    deps: DashboardDeps,
     *,
     status_code: int = 200,
     csrf_token: str | None = None,
     secure: bool | None = None,
     **context,
 ) -> HTMLResponse:
-    """Render a Jinja2 template, ensuring a CSRF cookie is in place."""
+    """Render a Jinja2 template, ensuring a CSRF cookie is in place.
+
+    ``deps`` is required so the CSRF cookie's Secure flag follows the same
+    proxy trust as the session cookie, instead of a default that would
+    silently trust every peer.
+    """
     if secure is None:
-        secure = _is_secure(request)
+        secure = _is_secure(request, deps.trusted_proxies)
     token = csrf_token or csrf.cookie_token(request)
     if not token:
         token = csrf.issue_token()
@@ -382,6 +390,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
         return _render(
             "login.html",
             request,
+            deps,
             client_id="",
             next=request.query_params.get("next", ""),
             banner=None,
@@ -474,6 +483,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
                 return _render(
                     "login.html",
                     request,
+                    deps,
                     client_id="",
                     next="",
                     banner=message,
@@ -504,6 +514,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
             return _render(
                 "login.html",
                 request,
+                deps,
                 client_id=client_id,
                 next=next_url if next_url != _default_landing() else "",
                 banner=message,
@@ -565,6 +576,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
         return _render(
             "totp_refresh.html",
             request,
+            deps,
             client_id=session.client_id,
             client_name=client_name,
             next=request.query_params.get("next", ""),
@@ -597,6 +609,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
             return _render(
                 "totp_refresh.html",
                 request,
+                deps,
                 client_id=session.client_id,
                 client_name=client_name,
                 next=next_url if next_url != _default_landing() else "",
@@ -665,6 +678,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
         return _render(
             "overview.html",
             request,
+            deps,
             client_name=(
                 deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
                 or "Unknown"
@@ -680,6 +694,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
         return _render(
             "usage_cost.html",
             request,
+            deps,
             client_name=(
                 deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
                 or "Unknown"
@@ -803,6 +818,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
         return _render(
             "connectors.html",
             request,
+            deps,
             client_id=session.client_id,
             client_name=(
                 deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
@@ -1271,6 +1287,7 @@ def build_dashboard_routes(deps: DashboardDeps) -> list[Route | Mount]:
         return _render(
             "chat.html",
             request,
+            deps,
             client_id=session.client_id,
             client_name=(
                 deps.client_store.get_name(session.client_id)  # type: ignore[attr-defined]
@@ -1889,6 +1906,7 @@ def _render_tokens_page(
     return _render(
         "tokens.html",
         request,
+        deps,
         client_id=session.client_id,
         client_name=client_name,
         tokens=tokens,
